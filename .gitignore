@@ -1,0 +1,15 @@
+# ImageWorks data is stored separately and must not be committed.
+/Gallery/
+/Inbox/
+/Processed/
+/.downloads/
+/.previews/
+/.posters/
+/Logs/
+/.imageworks-state.json*
+/.extracting-*/
+/node_modules/
+*.log
+/.jxl-pilot-*/
+/.jxl-work-*/
+/.gallery-trash/

@@ -1,0 +1,30 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { createPreviewCache, cleanPreviews } = require('../previews');
+
+test('previews deduplicate requests, regenerate after changes and remove old cached files', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-preview-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const image = path.join(root, 'image.jpg');
+  const cache = path.join(root, 'cache');
+  await fs.writeFile(image, 'image');
+  let calls = 0;
+  const preview = createPreviewCache(cache, async (command, args) => { calls++; await fs.writeFile(args.at(-1), 'preview'); });
+  const stat = await fs.stat(image);
+  const [first, second] = await Promise.all([preview(image, stat), preview(image, stat)]);
+  assert.equal(first, second);
+  assert.equal(calls, 1);
+  assert.equal(await fs.readFile(first, 'utf8'), 'preview');
+  await fs.writeFile(image, 'changed image');
+  const updated = await preview(image, await fs.stat(image));
+  assert.notEqual(updated, first);
+  assert.equal(calls, 2);
+  const old = new Date(Date.now() - 31 * 86400000);
+  await fs.utimes(first, old, old);
+  await cleanPreviews(cache);
+  await assert.rejects(fs.access(first));
+  await fs.access(updated);
+});

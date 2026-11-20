@@ -1,0 +1,627 @@
+const http = require('http');
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const { spawn } = require('child_process');
+const { createPosterCache, fallbackPoster, parseRange } = require('./video');
+const { createPreviewCache, cleanPreviews } = require('./previews');
+const { readActivity } = require('./activity');
+const { createPilot } = require('./jpeg-xl-pilot');
+const { moveToTrash, listTrash, restoreTrash, deleteTrash } = require('./gallery-trash');
+const { listDownloadCache, removeDownloadCache } = require('./download-cache');
+
+const ROOT = __dirname;
+const DATA_ROOT = path.resolve(process.env.IMAGEWORKS_DATA || ROOT);
+const INBOX = path.join(DATA_ROOT, 'Inbox');
+const PROCESSED = path.join(DATA_ROOT, 'Processed');
+const { planMove, executeMove } = require('./processed-archives');
+const GALLERY = path.join(DATA_ROOT, 'Gallery');
+const TRASH = path.join(DATA_ROOT, '.gallery-trash');
+const getPoster = createPosterCache(path.join(DATA_ROOT, '.posters'));
+const PREVIEW_CACHE = path.join(DATA_ROOT, '.previews');
+const getPreview = createPreviewCache(PREVIEW_CACHE);
+const PUBLIC = path.join(ROOT, 'public');
+const DOWNLOAD_CACHE = path.join(DATA_ROOT, '.downloads');
+const { downloadMedia } = require('./downloader');
+const log = require('./logger').createLogger(path.join(DATA_ROOT, 'Logs'));
+const failedImports = new Map();
+const STATE_FILE = path.join(DATA_ROOT, '.imageworks-state.json');
+const HOST = process.env.HOST || '127.0.0.1';
+const PORT = Number(process.env.PORT || 4173);
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.bmp', '.tif', '.tiff', '.webm', '.jxl']);
+const MIME = {
+  '.webm': 'video/webm', '.jxl': 'image/jxl',
+  '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.avif': 'image/avif', '.bmp': 'image/bmp', '.tif': 'image/tiff', '.tiff': 'image/tiff'
+};
+
+let state = { processed: {} };
+let activity = { status: 'idle', message: 'Watching Inbox', archive: null, updatedAt: new Date().toISOString() };
+let scanRunning = false;
+let cacheRemovalRunning = false;
+let galleryTrashRunning = false;
+let pilotJob = { status: 'idle' };
+let summaryCache = null;
+let summaryGeneration = 0;
+let summaryScan = null;
+function invalidateSummary() { summaryGeneration++; summaryCache = null; }
+async function getSummary() {
+  while (!summaryCache) {
+    if (!summaryScan) {
+      const generation = summaryGeneration;
+      summaryScan = getAlbums({ summary: true }).then(albums => {
+        if (generation === summaryGeneration) summaryCache = albums;
+      }).finally(() => { summaryScan = null; });
+    }
+    await summaryScan;
+  }
+  return summaryCache;
+}
+const stability = new Map();
+let downloadJob = { status: 'idle', message: 'Ready for a link', url: '', progress: 0, current: 0, total: 0, log: [], updatedAt: new Date().toISOString() };
+
+function normalizeAlbumName(value) {
+  return value
+    .replace(/\.part\d+$/i, '')
+    .replace(/\+/g, ' ')
+    .replace(/[._]+/g, ' ')
+    .replace(/\s*[–—]\s*/g, ' - ')
+    .replace(/\s+-\s+/g, ' - ')
+    .replace(/\s+/g, ' ')
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/[. ]+$/g, '')
+    .trim() || 'Untitled gallery';
+}
+
+function cleanAlbumName(filename) {
+  return normalizeAlbumName(path.basename(filename).replace(/\.(?:rar|zip)$/i, ''));
+}
+
+function albumDetails(folderName) {
+  const name = normalizeAlbumName(folderName);
+  const parts = name.split(/\s+-\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return { name, model: parts.slice(0, -1).join(' - '), set: parts.at(-1) };
+  }
+  return { name, model: '', set: name };
+}
+
+function decodeThreadText(value) {
+  return String(value || '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&quot;/g, '"')
+    .replace(/&#039;|&apos;/g, "'").replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ').trim();
+}
+
+async function getDownloadSource(sourceUrl) {
+  const parsed = new URL(sourceUrl);
+  const match = parsed.pathname.match(/^\/([a-z0-9]+)\/thread\/(\d+)(?:\/([^/?#]+))?/i);
+  if (!match) return null;
+  const [, board, threadId, slug = ''] = match;
+  let title = decodeThreadText(decodeURIComponent(slug).replace(/[-_]+/g, ' '));
+  try {
+    const response = await fetch(`https://a.4cdn.org/${board}/thread/${threadId}.json`, {
+      headers: { 'User-Agent': 'ImageWorks Gallery' }, signal: AbortSignal.timeout(10000)
+    });
+    if (response.ok) {
+      const data = await response.json();
+      const openingPost = data.posts?.[0] || {};
+      title = decodeThreadText(openingPost.sub) || title || decodeThreadText(openingPost.com).slice(0, 90);
+    }
+  } catch { /* The downloader will report an unreachable or expired thread. */ }
+  return { type: '4chan', board: board.toLowerCase(), threadId, title: normalizeAlbumName(title || `Thread ${threadId}`), sourceUrl };
+}
+
+async function readAlbumSource(dir, folderName) {
+  try {
+    const source = JSON.parse(await fsp.readFile(path.join(dir, '.imageworks-source.json'), 'utf8'));
+    if (source?.type === '4chan') return source;
+  } catch { /* Legacy galleries do not have source metadata. */ }
+  const legacy = folderName.match(/^4chan\s+([a-z0-9]+)\s+(\d+)$/i);
+  return legacy ? { type: '4chan', board: legacy[1].toLowerCase(), threadId: legacy[2], title: `Thread ${legacy[2]}` } : null;
+}
+
+function safeResolve(root, requestPath) {
+  const resolved = path.resolve(root, requestPath);
+  return resolved === root || resolved.startsWith(root + path.sep) ? resolved : null;
+}
+
+async function exists(file) { try { await fsp.access(file); return true; } catch { return false; } }
+
+async function loadState() {
+  try {
+    state = JSON.parse(await fsp.readFile(STATE_FILE, 'utf8'));
+    if (!state.processed || typeof state.processed !== 'object') throw new Error('Import state is missing its processed archive map.');
+  } catch (error) {
+    if (error.code !== 'ENOENT') log('error', 'state.load_failed', { file: STATE_FILE, error });
+    state = { processed: {} };
+  }
+}
+
+async function saveState() {
+  await fsp.writeFile(STATE_FILE + '.tmp', JSON.stringify(state, null, 2));
+  await fsp.rename(STATE_FILE + '.tmp', STATE_FILE);
+}
+
+async function walkImages(root, current = root) {
+  const output = [];
+  for (const entry of await fsp.readdir(current, { withFileTypes: true })) {
+    const full = path.join(current, entry.name);
+    if (entry.isDirectory()) output.push(...await walkImages(root, full));
+    else if (entry.isFile() && IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && (!/\.jxl$/i.test(entry.name) || /\.jpe?g\.jxl$/i.test(entry.name))) output.push(full);
+  }
+  return output;
+}
+
+function run7zip(archive, destination) {
+  return new Promise((resolve, reject) => {
+    const command = process.env.SEVENZIP || '7z';
+    const child = spawn(command, ['x', '-y', '-p', `-o${destination}`, archive], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-16384); });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16384); });
+    child.on('error', error => {
+      if (error.code === 'ENOENT') error.message = `Archive extractor "${command}" was not found. Install 7zip or set SEVENZIP to its executable path.`;
+      error.command = command;
+      reject(error);
+    });
+    child.on('close', (code, signal) => {
+      if (code === 0) return resolve();
+      const error = new Error(`Archive extraction failed (${signal ? `signal ${signal}` : `exit code ${code}`}): ${(stderr || stdout).trim().slice(-2000) || 'No diagnostic output.'}`);
+      Object.assign(error, { command, exitCode: code, signal, stdout, stderr });
+      reject(error);
+    });
+  });
+}
+
+async function uniqueDestination(target) {
+  if (!await exists(target)) return target;
+  const ext = path.extname(target);
+  const stem = target.slice(0, -ext.length);
+  for (let n = 2; ; n++) {
+    const candidate = `${stem} (${n})${ext}`;
+    if (!await exists(candidate)) return candidate;
+  }
+}
+
+async function importArchive(archive) {
+  const albumName = cleanAlbumName(path.basename(archive));
+  const albumDir = path.join(GALLERY, albumName);
+  const tempDir = path.join(DATA_ROOT, `.extracting-${process.pid}-${Date.now()}`);
+  activity = { status: 'working', message: `Unpacking ${path.basename(archive)}`, archive: path.basename(archive), updatedAt: new Date().toISOString() };
+  const started = Date.now();
+  log('info', 'archive.import_started', { archive, album: albumName });
+  try {
+    await fsp.mkdir(tempDir, { recursive: true });
+    await run7zip(archive, tempDir);
+    const images = await walkImages(tempDir);
+    if (!images.length) throw new Error('The archive did not contain any supported media files.');
+    await fsp.mkdir(albumDir, { recursive: true });
+    for (const image of images) {
+      const relative = path.relative(tempDir, image);
+      const requested = path.join(albumDir, relative);
+      const destination = await uniqueDestination(requested);
+      await fsp.mkdir(path.dirname(destination), { recursive: true });
+      await fsp.copyFile(image, destination);
+    }
+    invalidateSummary();
+    activity = { status: 'success', message: `Added ${images.length} file${images.length === 1 ? '' : 's'} to ${albumName}`, archive: path.basename(archive), updatedAt: new Date().toISOString() };
+    log('info', 'archive.import_completed', { archive, album: albumName, images: images.length, durationMs: Date.now() - started });
+    return images.length;
+  } catch (error) {
+    activity = { status: 'error', message: `${path.basename(archive)}: ${error.message}`, archive: path.basename(archive), updatedAt: new Date().toISOString() };
+    throw error;
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(error => log('error', 'archive.cleanup_failed', { archive, tempDir, error }));
+  }
+}
+
+async function scanInbox() {
+  if (scanRunning || galleryTrashRunning) return;
+  scanRunning = true;
+  try {
+    const entries = await fsp.readdir(INBOX, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !/\.(?:rar|zip)$/i.test(entry.name) || /\.part(?!0*1\.)\d+\.rar$/i.test(entry.name)) continue;
+      const archive = path.join(INBOX, entry.name);
+      const stat = await fsp.stat(archive);
+      const signature = `${stat.size}:${stat.mtimeMs}`;
+      const failure = failedImports.get(entry.name);
+      if (failure && failure.signature === signature && Date.now() < failure.retryAt) continue;
+      const previous = stability.get(entry.name);
+      if (!previous || previous.signature !== signature) {
+        stability.set(entry.name, { signature, checks: 1 });
+        continue;
+      }
+      previous.checks++;
+      if (previous.checks < 3) continue;
+      let imported = state.processed[entry.name] === signature;
+      try {
+        state.pendingMoves ||= {};
+        let plan = state.pendingMoves[entry.name];
+        if (!imported) {
+          plan = await planMove(archive, PROCESSED);
+          await importArchive(archive);
+          state.processed[entry.name] = signature;
+          state.pendingMoves[entry.name] = plan;
+          imported = true;
+          await saveState();
+        } else if (!plan) {
+          plan = await planMove(archive, PROCESSED);
+          state.pendingMoves[entry.name] = plan;
+          await saveState();
+        }
+        await executeMove(plan);
+        delete state.pendingMoves[entry.name];
+        await saveState();
+        failedImports.delete(entry.name);
+        log('info', 'archive.moved_to_processed', { archive, destination: plan.destination, files: plan.files.length });
+      } catch (error) {
+        const attempts = failure?.signature === signature ? failure.attempts + 1 : 1;
+        const retryMs = Math.min(300000, 30000 * 2 ** Math.min(attempts - 1, 4));
+        failedImports.set(entry.name, { signature, attempts, retryAt: Date.now() + retryMs });
+        log('error', imported ? 'archive.move_failed' : 'archive.import_failed', { archive, signature, attempts, retryInSeconds: retryMs / 1000, error });
+        if (imported) activity = { status: 'error', message: `Imported ${entry.name}, but could not move it out of Inbox: ${error.message}`, archive: entry.name, updatedAt: new Date().toISOString() };
+      } finally {
+        stability.delete(entry.name);
+      }
+    }
+  } catch (error) {
+    log('error', 'inbox.scan_failed', { inbox: INBOX, error });
+  } finally { scanRunning = false; }
+}
+
+async function getAlbums({ id, summary = false } = {}) {
+  const albums = [];
+  for (const entry of await fsp.readdir(GALLERY, { withFileTypes: true })) {
+    if (!entry.isDirectory() || (id !== undefined && entry.name !== id)) continue;
+    const dir = path.join(GALLERY, entry.name);
+    const images = await walkImages(dir);
+    if (!images.length) continue;
+    const items = await Promise.all(images.map(async file => {
+      const stat = await fsp.stat(file);
+      const relative = path.relative(GALLERY, file).split(path.sep).map(encodeURIComponent).join('/');
+      return { name: path.basename(file).replace(/\.jxl$/i, ''), preview: path.extname(file).toLowerCase() === '.webm' ? null : `/preview/${relative}`, type: path.extname(file).toLowerCase() === '.webm' ? 'video' : 'image', poster: path.extname(file).toLowerCase() === '.webm' ? `/poster/${relative}` : null, url: path.extname(file).toLowerCase() === '.jxl' ? `/reconstructed/${relative}` : `/gallery/${relative}`, jxl: path.extname(file).toLowerCase() === '.jxl', sizeBytes: stat.size, modifiedAt: stat.mtime.toISOString() };
+    }));
+    items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const modifiedAt = items.reduce((latest, item) => item.modifiedAt > latest ? item.modifiedAt : latest, items[0].modifiedAt);
+    const source = await readAlbumSource(dir, entry.name);
+    const details = source?.type === '4chan'
+      ? { name: entry.name, model: '', set: source.title || `Thread ${source.threadId}` }
+      : albumDetails(entry.name);
+    albums.push({ id: entry.name, ...details, kind: source?.type || 'collection', source, count: items.length, sizeBytes: items.reduce((sum, item) => sum + item.sizeBytes, 0), cover: items[0].poster || items[0].preview || items[0].url, coverType: items[0].type, modifiedAt, ...(summary ? {} : { images: items }) });
+  }
+  return albums.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+}
+
+function supportedDownloadUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+    const host = url.hostname.toLowerCase();
+    if ((host === 'boards.4chan.org' || host === 'boards.4channel.org') && /^\/[a-z0-9]+\/thread\/\d+/i.test(url.pathname)) return true;
+    return (host === 'goonbox.cr' || host === 'www.goonbox.cr') && /^\/a\/[a-z0-9]+/i.test(url.pathname);
+  } catch { return false; }
+}
+
+function addDownloadLog(line) {
+  const clean = line.trim();
+  if (!clean) return;
+  downloadJob.log.push(clean);
+  downloadJob.log = downloadJob.log.slice(-60);
+  downloadJob.message = clean;
+  const progress = clean.match(/^\[(\d+)\/(\d+)\]/);
+  if (progress) {
+    downloadJob.current = Number(progress[1]);
+    downloadJob.total = Number(progress[2]);
+    downloadJob.progress = Math.round((downloadJob.current / downloadJob.total) * 100);
+  }
+  downloadJob.updatedAt = new Date().toISOString();
+}
+
+async function copyDownloadedImages(sourceDir, targetDir, includeWebm = false) {
+  const images = (await walkImages(sourceDir)).filter(file => includeWebm || path.extname(file).toLowerCase() !== '.webm');
+  await fsp.mkdir(targetDir, { recursive: true });
+  let added = 0;
+  let skipped = 0;
+  for (const image of images) {
+    const relative = path.relative(sourceDir, image);
+    const requested = path.join(targetDir, relative);
+    await fsp.mkdir(path.dirname(requested), { recursive: true });
+    if (await exists(requested)) {
+      const [sourceStat, targetStat] = await Promise.all([fsp.stat(image), fsp.stat(requested)]);
+      if (sourceStat.size === targetStat.size) { skipped++; continue; }
+    }
+    const destination = await uniqueDestination(requested);
+    await fsp.copyFile(image, destination);
+    added++;
+  }
+  return { added, skipped, total: images.length };
+}
+
+async function finishDownload(code) {
+  if (code !== 0) throw new Error(`Downloader stopped with code ${code}.`);
+  const savedLine = [...downloadJob.log].reverse().find(line => line.startsWith('Saved to: '));
+  if (!savedLine) throw new Error('The downloader did not report an output folder.');
+  const sourceDir = path.resolve(savedLine.slice(10).trim());
+  const cacheRoot = path.resolve(DOWNLOAD_CACHE);
+  if (!sourceDir.startsWith(cacheRoot + path.sep)) throw new Error('The downloader returned an unexpected output folder.');
+  const relative = path.relative(cacheRoot, sourceDir).split(path.sep);
+  const isGoonBox = relative[0].toLowerCase() === 'goonbox';
+  let albumName = isGoonBox
+    ? normalizeAlbumName(path.basename(sourceDir))
+    : normalizeAlbumName(`4chan ${relative.at(-2) || 'thread'} ${relative.at(-1)}`);
+  if (downloadJob.source?.type === '4chan') {
+    for (const entry of await fsp.readdir(GALLERY, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const existing = await readAlbumSource(path.join(GALLERY, entry.name), entry.name);
+      if (existing?.board === downloadJob.source.board && existing?.threadId === downloadJob.source.threadId) {
+        albumName = entry.name;
+        break;
+      }
+    }
+  }
+  const albumDir = path.join(GALLERY, albumName);
+  const result = await copyDownloadedImages(sourceDir, albumDir, downloadJob.source?.includeWebm === true);
+  if (downloadJob.source?.type === '4chan') {
+    await fsp.writeFile(path.join(albumDir, '.imageworks-source.json'), JSON.stringify(downloadJob.source, null, 2));
+  }
+  invalidateSummary();
+  downloadJob.status = 'success';
+  downloadJob.progress = 100;
+  downloadJob.message = result.added
+    ? `Added ${result.added} file${result.added === 1 ? '' : 's'} to ${albumName}`
+    : `${albumName} is already up to date`;
+  downloadJob.album = albumName;
+  downloadJob.updatedAt = new Date().toISOString();
+  activity = { status: 'success', message: downloadJob.message, archive: null, updatedAt: downloadJob.updatedAt };
+  log('info', 'download.completed', { album: albumName, ...result });
+}
+
+async function startDownload(req, res) {
+  const body = await readJson(req);
+  const url = typeof body.url === 'string' ? body.url.trim() : '';
+  if (!supportedDownloadUrl(url)) return sendJson(res, 400, { error: 'Paste a valid 4chan thread or GoonBox album link.' });
+  if (downloadJob.status === 'working' || cacheRemovalRunning || galleryTrashRunning) return sendJson(res, 409, { error: 'A download or gallery operation is already running.' });
+  downloadJob.status = 'working';
+  try { await fsp.mkdir(DOWNLOAD_CACHE, { recursive: true }); } catch (error) { downloadJob.status = 'error'; throw error; }
+  const source = await getDownloadSource(url);
+  if (source) source.includeWebm = body.includeWebm === true;
+  downloadJob = { status: 'working', message: 'Starting download…', url, source, progress: 0, current: 0, total: 0, log: [], updatedAt: new Date().toISOString() };
+  log('info', 'download.started');
+  downloadMedia(url, DOWNLOAD_CACHE, addDownloadLog, fetch, { includeWebm: source?.includeWebm === true })
+    .then(() => finishDownload(0))
+    .catch(error => {
+      log('error', 'download.failed', { error });
+      downloadJob.status = 'error';
+      downloadJob.errorCode = error.code === 'THREAD_NOT_FOUND' ? error.code : undefined;
+      downloadJob.message = error.code === 'THREAD_NOT_FOUND' ? 'This thread is not currently available on 4chan. Your saved gallery is unchanged.' : error.message;
+      downloadJob.updatedAt = new Date().toISOString();
+    });
+  return sendJson(res, 202, { download: downloadJob });
+}
+
+async function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > 4096) reject(new Error('Request is too large.'));
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body || '{}')); } catch { reject(new Error('Invalid request.')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+async function renameAlbum(req, res) {
+  const body = await readJson(req);
+  if (typeof body.id !== 'string' || typeof body.name !== 'string') return sendJson(res, 400, { error: 'Album and name are required.' });
+  if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current gallery operation to finish.' });
+  galleryTrashRunning = true;
+  try {
+  const oldDir = safeResolve(GALLERY, body.id);
+  const newName = normalizeAlbumName(body.name);
+  const newDir = path.join(GALLERY, newName);
+  if (!oldDir || path.dirname(oldDir) !== GALLERY || !(await exists(oldDir))) return sendJson(res, 404, { error: 'Gallery not found.' });
+  if (oldDir.toLowerCase() === newDir.toLowerCase()) {
+    if (oldDir !== newDir) { await fsp.rename(oldDir, newDir); invalidateSummary(); }
+    return sendJson(res, 200, { album: albumDetails(newName) });
+  }
+  if (await exists(newDir)) return sendJson(res, 409, { error: 'A gallery with that name already exists.' });
+  await fsp.rename(oldDir, newDir);
+  invalidateSummary();
+  activity = { status: 'success', message: `Renamed gallery to ${newName}`, archive: null, updatedAt: new Date().toISOString() };
+  return sendJson(res, 200, { album: albumDetails(newName) });
+  } finally { galleryTrashRunning = false; }
+}
+
+function urlDownload(req) { return new URL(req.url, 'http://localhost').searchParams.has('download'); }
+
+async function serveFile(req, res, root, relative) {
+  const decoded = decodeURIComponent(relative);
+  const file = safeResolve(root, decoded);
+  if (!file) return sendJson(res, 403, { error: 'Forbidden' });
+  try {
+    const stat = await fsp.stat(file);
+    if (!stat.isFile()) throw new Error('Not a file');
+    const headers = { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Content-Length': stat.size, 'Cache-Control': 'no-cache', 'Accept-Ranges': 'bytes' };
+    let range;
+    if (req.headers.range) {
+      range = parseRange(req.headers.range, stat.size);
+      if (!range) { res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` }); return res.end(); }
+      headers['Content-Range'] = `bytes ${range.start}-${range.end}/${stat.size}`;
+      headers['Content-Length'] = range.end - range.start + 1;
+    }
+    if (urlDownload(req)) headers['Content-Disposition'] = 'attachment';
+    res.writeHead(range ? 206 : 200, headers);
+    if (req.method === 'HEAD') return res.end();
+    const stream = fs.createReadStream(file, range || {});
+    stream.on('error', () => res.destroy());
+    res.on('close', () => stream.destroy());
+    stream.pipe(res);
+  } catch { sendJson(res, 404, { error: 'Not found' }); }
+}
+
+async function serveReconstructed(req, res, relative) {
+  const file = safeResolve(GALLERY, decodeURIComponent(relative));
+  if (!file || !/\.jpe?g\.jxl$/i.test(file)) return sendJson(res, 404, { error: 'Not found' });
+  try { if (!(await fsp.stat(file)).isFile()) throw new Error(); }
+  catch { return sendJson(res, 404, { error: 'Not found' }); }
+  const child = spawn(process.env.IMAGEWORKS_DJXL || 'djxl', [file, '-', '--output_format=jpeg', '--num_threads=1', '--quiet'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  child.stdout.once('data', chunk => {
+    if (res.destroyed) return;
+    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache', ...(urlDownload(req) ? { 'Content-Disposition': 'attachment' } : {}) });
+    if (req.method === 'HEAD') { res.end(); child.kill(); return; }
+    res.write(chunk);
+    child.stdout.pipe(res);
+  });
+  child.on('error', () => { if (!res.headersSent) sendJson(res, 500, { error: 'JPEG XL decoder unavailable.' }); else res.destroy(); });
+  child.on('close', code => { if ((code !== 0 || !res.headersSent) && !res.writableEnded && !res.destroyed) { if (!res.headersSent) sendJson(res, 500, { error: 'JPEG reconstruction failed.' }); else res.destroy(); } });
+  res.on('close', () => { if (child.exitCode === null) child.kill(); });
+}
+
+async function servePoster(req, res, relative) {
+  const file = safeResolve(GALLERY, decodeURIComponent(relative));
+  if (!file || path.extname(file).toLowerCase() !== '.webm') return sendJson(res, 404, { error: 'Not found' });
+  let stat;
+  try { stat = await fsp.stat(file); if (!stat.isFile()) throw new Error(); }
+  catch { return sendJson(res, 404, { error: 'Not found' }); }
+  const poster = await getPoster(file, stat);
+  if (poster) return serveFile(req, res, path.dirname(poster), path.basename(poster));
+  res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache' });
+  res.end(req.method === 'HEAD' ? undefined : fallbackPoster);
+}
+
+async function directorySize(dir) {
+  let entries;
+  try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return 0; throw error; }
+  let size = 0;
+  for (const entry of entries) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) size += await directorySize(file);
+    else if (entry.isFile()) {
+      try { size += (await fsp.lstat(file)).size; }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+  }
+  return size;
+}
+
+async function storageInfo() {
+  const folders = { inbox: INBOX, processed: PROCESSED, downloads: DOWNLOAD_CACHE, trash: TRASH, previews: PREVIEW_CACHE, posters: path.join(DATA_ROOT, '.posters') };
+  const sizes = {};
+  for (const [name, dir] of Object.entries(folders)) sizes[name] = await directorySize(dir);
+  sizes.gallery = (await getSummary()).reduce((sum, album) => sum + album.sizeBytes, 0);
+  const disk = await fsp.statfs(DATA_ROOT);
+  return { sizes, free: disk.bavail * disk.bsize, total: disk.blocks * disk.bsize };
+}
+
+async function servePreview(req, res, relative) {
+  const file = safeResolve(GALLERY, decodeURIComponent(relative));
+  if (!file || !IMAGE_EXTENSIONS.has(path.extname(file).toLowerCase()) || path.extname(file).toLowerCase() === '.webm') return sendJson(res, 404, { error: 'Not found' });
+  let stat;
+  try { stat = await fsp.stat(file); if (!stat.isFile()) throw new Error(); }
+  catch { return sendJson(res, 404, { error: 'Not found' }); }
+  const preview = await getPreview(file, stat);
+  if (preview) return serveFile(req, res, PREVIEW_CACHE, path.basename(preview));
+  return serveFile(req, res, GALLERY, relative);
+}
+
+function sendJson(res, status, value) {
+  const body = JSON.stringify(value);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
+  res.end(body);
+}
+
+async function handleRequest(req, res) {
+  const remote = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  if (!(remote === '127.0.0.1' || remote === '::1' || (process.env.LAN_PREFIX && remote.startsWith(process.env.LAN_PREFIX)))) return sendJson(res, 403, { error: 'Home network only.' });
+  if (req.method === 'POST' && req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) return sendJson(res, 403, { error: 'Origin not allowed.' });
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (url.pathname === '/api/albums') return sendJson(res, 200, { albums: await (url.searchParams.get('summary') === '1' && !url.searchParams.has('id') ? getSummary() : getAlbums({ id: url.searchParams.has('id') ? url.searchParams.get('id') : undefined, summary: url.searchParams.get('summary') === '1' })), activity });
+  if (url.pathname === '/api/jxl-pilot' && req.method === 'GET') return sendJson(res, 200, { pilot: pilotJob });
+  if (url.pathname === '/api/jxl-pilot' && req.method === 'POST') {
+    const body = await readJson(req);
+    if (pilotJob.status === 'working' || galleryTrashRunning) return sendJson(res, 409, { error: 'A gallery operation is already running.' });
+    if (typeof body.id !== 'string' || !body.id || body.id === '.' || body.id === '..' || path.basename(body.id) !== body.id || body.id.includes('\\')) return sendJson(res, 400, { error: 'Invalid gallery.' });
+    pilotJob = { status: 'working', album: body.id, done: 0, total: 0 };
+    createPilot({ galleryRoot: GALLERY, dataRoot: DATA_ROOT, albumId: body.id, onProgress: progress => Object.assign(pilotJob, progress) })
+      .then(result => { pilotJob = { status: 'success', ...result }; invalidateSummary(); log('info', 'jxl.pilot_completed', result); })
+      .catch(error => { pilotJob = { status: 'error', message: error.code === 'ENOENT' && error.path && /(?:cjxl|djxl)$/.test(error.path) ? 'Install libjxl-tools to use the pilot.' : error.message }; log('error', 'jxl.pilot_failed', { error }); });
+    return sendJson(res, 202, { pilot: pilotJob });
+  }
+  if (url.pathname === '/api/gallery-trash' && req.method === 'GET') return sendJson(res, 200, { entries: await listTrash(TRASH) });
+  if (['/api/gallery-trash/move', '/api/gallery-trash/restore', '/api/gallery-trash/delete'].includes(url.pathname) && req.method === 'POST') {
+    const body = await readJson(req);
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      let result;
+      if (url.pathname.endsWith('/move')) result = await moveToTrash(GALLERY, TRASH, body.id);
+      else if (url.pathname.endsWith('/restore')) result = await restoreTrash(GALLERY, TRASH, body.id);
+      else result = await deleteTrash(TRASH, body.id);
+      invalidateSummary();
+      const action = url.pathname.split('/').at(-1);
+      log('info', `gallery.trash_${action}`, { album: result.name });
+      return sendJson(res, 200, { entry: result });
+    } catch (error) {
+      const status = /already exists/.test(error.message) ? 409 : 400;
+      return sendJson(res, status, { error: error.message });
+    } finally { galleryTrashRunning = false; }
+  }
+  if (url.pathname === '/api/activity' && req.method === 'GET') return sendJson(res, 200, { events: await readActivity(path.join(DATA_ROOT, 'Logs')) });
+  if (url.pathname === '/api/storage/download-cache' && req.method === 'GET') return sendJson(res, 200, { entries: await listDownloadCache(DOWNLOAD_CACHE), busy: downloadJob.status === 'working' || cacheRemovalRunning });
+  if (url.pathname === '/api/storage/download-cache' && req.method === 'POST') {
+    const body = await readJson(req);
+    if (downloadJob.status === 'working' || cacheRemovalRunning) return sendJson(res, 409, { error: 'Wait for the current download or cache removal to finish.' });
+    cacheRemovalRunning = true;
+    try {
+      await removeDownloadCache(DOWNLOAD_CACHE, body.id);
+      log('info', 'download.cache_removed', { cache: body.id });
+      return sendJson(res, 200, { ok: true });
+    } catch (error) { return sendJson(res, 400, { error: error.message }); }
+    finally { cacheRemovalRunning = false; }
+  }
+  if (url.pathname === '/api/storage' && req.method === 'GET') return sendJson(res, 200, await storageInfo());
+  if (url.pathname === '/api/storage/previews' && req.method === 'POST') {
+    await cleanPreviews(PREVIEW_CACHE, 0);
+    log('info', 'preview.cleared');
+    return sendJson(res, 200, { ok: true });
+  }
+  if (url.pathname === '/api/albums/rename' && req.method === 'POST') return renameAlbum(req, res);
+  if (url.pathname === '/api/download' && req.method === 'GET') return sendJson(res, 200, { download: downloadJob });
+  if (url.pathname === '/api/download' && req.method === 'POST') return startDownload(req, res);
+  if (url.pathname.startsWith('/reconstructed/')) return serveReconstructed(req, res, url.pathname.slice(15));
+  if (url.pathname.startsWith('/preview/')) return servePreview(req, res, url.pathname.slice(9));
+  if (url.pathname.startsWith('/poster/')) return servePoster(req, res, url.pathname.slice(8));
+  if (url.pathname.startsWith('/gallery/')) return serveFile(req, res, GALLERY, url.pathname.slice(9));
+  const requested = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+  return serveFile(req, res, PUBLIC, requested);
+}
+
+async function main() {
+  await Promise.all([fsp.mkdir(INBOX, { recursive: true }), fsp.mkdir(GALLERY, { recursive: true }), fsp.mkdir(DOWNLOAD_CACHE, { recursive: true })]);
+  await loadState();
+  await getSummary();
+  setInterval(() => { invalidateSummary(); getSummary().catch(error => log('error', 'gallery.scan_failed', { error })); }, 60000).unref();
+  const cleanupPreviews = () => cleanPreviews(PREVIEW_CACHE).catch(error => log('error', 'preview.cleanup_failed', { error }));
+  cleanupPreviews();
+  setInterval(cleanupPreviews, 86400000).unref();
+  log('info', 'service.started', { inbox: INBOX, gallery: GALLERY, extractor: process.env.SEVENZIP || '7z' });
+  setInterval(scanInbox, Math.max(100, Number(process.env.IMAGEWORKS_SCAN_INTERVAL || 2000))).unref();
+  await scanInbox();
+  http.createServer((req, res) => handleRequest(req, res).catch(error => { log('error', 'request.failed', { method: req.method, pathname: req.url.split('?')[0], error }); sendJson(res, 500, { error: error.message }); }))
+    .listen(PORT, HOST, function () { console.log(`ImageWorks is watching ${INBOX}\nGallery: http://${HOST}:${this.address().port}`); })
+    .on('error', error => { log('error', 'service.listen_failed', { host: HOST, port: PORT, error }); process.exitCode = 1; });
+}
+
+main().catch(error => { log('error', 'service.start_failed', { error }); process.exitCode = 1; });

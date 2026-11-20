@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A private local gallery for images imported from ZIP or RAR archives.">
+  <title>ImageWorkx Gallery</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#gallery" aria-label="ImageWorkx gallery"><span class="brand-mark">IW</span><span>ImageWorkx</span></a>
+    <nav class="main-nav" aria-label="Main navigation"><a href="#gallery" data-page-link="gallery">Gallery</a><a href="#download" data-page-link="download">Download</a><a href="#storage" data-page-link="storage">Storage</a><a href="#activity" data-page-link="activity">Activity</a></nav>
+    <div id="status" class="status"><span class="status-pulse"></span><span>Watching Inbox</span></div>
+  </header>
+
+  <main>
+    <section id="gallery-page" class="page">
+      <section class="intro">
+        <div><p class="eyebrow">LOCAL COLLECTION</p><h1>Your galleries</h1></div>
+        <div class="stats"><strong id="album-count">0</strong> galleries <span></span> <strong id="image-count">0</strong> files <span aria-hidden="true"></span> <strong id="gallery-size" title="Combined size of gallery media; excludes archives and download cache">0 B</strong> total</div>
+      </section>
+      <div class="gallery-search" role="search" aria-label="Search local collection">
+        <label for="gallery-search">Search galleries</label>
+        <input id="gallery-search" type="search" placeholder="Search names, models or 4chan threads…" autocomplete="off" aria-controls="album-grid thread-grid" aria-describedby="search-results">
+        <p id="search-results" role="status" hidden></p>
+      </div>
+      <aside class="inbox-note" aria-label="Upload archives">
+        <p><strong>Add ZIP or RAR files:</strong> copy your archives into the ImageWorkx Inbox folder on the server. They’ll appear in the gallery after import.</p>
+        <p>If you have configured a network share, use your server’s address and share name to access it.</p>
+      </aside>
+      <section id="collection-section" class="gallery-section">
+        <div class="section-heading"><h2>Collections</h2><span id="collection-count"></span></div>
+        <div id="album-grid" class="album-grid" aria-live="polite"></div>
+      </section>
+      <section id="thread-section" class="gallery-section thread-section" hidden>
+        <div class="section-heading"><div><p class="eyebrow">FROM THE BOARDS</p><h2>4chan threads</h2></div><span id="thread-count"></span></div>
+        <div id="thread-grid" class="album-grid thread-grid"></div>
+      </section>
+      <section id="empty-state" class="empty-state" hidden>
+        <div class="empty-icon">＋</div><h2>Add your first gallery</h2>
+        <p>Drop a ZIP or RAR into Inbox or download a 4chan thread or GoonBox album.</p>
+        <code>ImageWorkx data directory / Inbox</code>
+      </section>
+    </section>
+
+    <section id="download-page" class="page download-page" hidden>
+      <section class="intro download-intro">
+        <div><p class="eyebrow">ADD TO GALLERY</p><h1>Download media</h1></div>
+      </section>
+      <div class="download-layout">
+        <form id="download-form" class="download-card">
+          <label for="source-url">4chan thread or GoonBox album</label>
+          <div class="url-entry"><input id="source-url" name="url" type="url" required placeholder="Paste a link…" autocomplete="url"><button id="download-submit" class="save-button" type="submit">Download</button></div>
+          <label class="webm-option"><input id="include-webm" type="checkbox"> Include WebM videos (4chan only)</label>
+          <p class="field-help">Supports boards.4chan.org, boards.4channel.org and goonbox.cr links.</p>
+          <p id="download-error" class="form-error" role="alert"></p>
+        </form>
+        <section id="download-job" class="download-job" aria-live="polite">
+          <div class="job-heading"><div><p class="eyebrow">STATUS</p><h2 id="download-message">Ready for a link</h2></div><strong id="download-percent">0%</strong></div>
+          <div class="progress-track" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="download-progress"></span></div>
+          <pre id="download-log">Downloads will appear here.</pre>
+        </section>
+      </div>
+    </section>
+    <section id="storage-page" class="page" hidden>
+      <section class="intro">
+        <div><p class="eyebrow">IMAGEWORKS</p><h1>Storage usage</h1></div>
+      </section>
+      <div class="storage-panel" id="storage-panel">
+        <p>See how much space ImageWorkx uses. Refresh the figures after imports or downloads.</p>
+        <button id="storage-refresh" class="text-button" type="button">Refresh storage</button>
+        <p id="storage-message" role="status"></p>
+        <dl id="storage-sizes" class="storage-sizes"></dl>
+        <p>Processed archives are retained separately from gallery files. Download cache may contain files needed to resume downloads.</p>
+        <button id="storage-clear-previews" class="text-button" type="button" disabled>Clear image previews</button>
+        <p>Image previews are recreated as needed; originals and video posters are kept.</p>
+        <section class="trash-section" aria-labelledby="trash-heading">
+          <h2 id="trash-heading">Gallery Trash</h2>
+          <p>Galleries remain here until you restore or permanently delete them. Trash continues to use disk space.</p>
+          <button id="trash-refresh" class="text-button" type="button">Load Trash</button>
+          <p id="trash-status" role="status"></p>
+          <ul id="trash-list" class="trash-list"></ul>
+        </section>
+        <section class="cache-section" aria-labelledby="cache-heading">
+          <h2 id="cache-heading">Download cache</h2>
+          <p>Cached downloads help retries and thread updates avoid downloading the same files again. Removing an entry deletes its cached files and retry history. Files already added to galleries are kept; later updates may re-download files or create duplicates.</p>
+          <button id="cache-refresh" class="text-button" type="button">Load cached downloads</button>
+          <p id="cache-status" role="status"></p>
+          <ul id="cache-list" class="cache-list"></ul>
+        </section>
+      </div>
+    </section>
+    <section id="activity-page" class="page" hidden>
+      <section class="intro"><div><p class="eyebrow">IMAGEWORKS</p><h1>Activity</h1></div></section>
+      <div class="activity-toolbar"><p>Recent imports, downloads, service starts and errors. Times are shown in your local time.</p><button id="activity-refresh" class="text-button" type="button">Refresh</button></div>
+      <p id="activity-status" role="status"></p>
+      <ol id="activity-list" class="activity-list"></ol>
+      <p class="activity-note">Showing up to 200 recent events from the retained logs. Older entries disappear as logs rotate.</p>
+    </section>
+  </main>
+
+  <button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" title="Back to top" hidden>↑</button>
+
+  <dialog id="viewer" class="viewer">
+    <div class="viewer-bar">
+      <div><button id="back" class="icon-button" aria-label="Back to galleries">←</button><div><small id="viewer-model" class="viewer-model"></small><strong id="viewer-title"></strong><small id="viewer-count"></small></div></div>
+      <div class="viewer-actions"><label id="thread-webm-option" class="webm-option" hidden><input id="thread-include-webm" type="checkbox"> WebM videos</label><button id="update-thread" class="text-button update-thread" type="button" hidden>Update thread</button><button id="jxl-pilot" class="text-button" type="button">JPEG XL pilot</button><button id="rename" class="text-button" type="button">Rename</button><button id="trash-gallery" class="text-button danger-button" type="button">Move to Trash</button><button id="close" class="icon-button" aria-label="Close gallery">×</button></div>
+    </div>
+    <div class="page-size-control"><label for="page-size">Files per page</label><select id="page-size"><option value="15" selected>15</option><option value="30">30</option><option value="60">60</option><option value="100">100</option></select></div>
+    <nav class="pagination" aria-label="Gallery pages at top">
+      <button id="page-previous" class="text-button" type="button">← Previous</button>
+      <div id="page-numbers" class="page-numbers"></div>
+      <button id="page-next" class="text-button" type="button">Next →</button>
+      <span id="page-status" class="page-status" role="status"></span>
+    </nav>
+    <p id="thread-update-message" class="thread-update-message" role="status"></p>
+    <p id="pilot-status" class="pilot-status" role="status"></p>
+    <p id="viewer-error" class="form-error" role="alert"></p>
+    <button id="gallery-back-to-top" class="back-to-top" type="button" aria-label="Back to top of gallery" title="Back to top" hidden>↑</button>
+    <div id="photo-grid" class="photo-grid"></div>
+    <nav class="pagination" aria-label="Gallery pages at bottom">
+      <button id="page-previous-bottom" class="text-button" type="button">← Previous</button>
+      <div id="page-numbers-bottom" class="page-numbers"></div>
+      <button id="page-next-bottom" class="text-button" type="button">Next →</button>
+      <span id="page-status-bottom" class="page-status" role="status"></span>
+    </nav>
+  </dialog>
+
+  <dialog id="rename-dialog" class="rename-dialog">
+    <form id="rename-form">
+      <p class="eyebrow">EDIT GALLERY</p>
+      <h2>Rename gallery</h2>
+      <label for="new-name">Gallery name</label>
+      <input id="new-name" name="name" maxlength="150" required autocomplete="off">
+      <p id="rename-error" class="form-error" role="alert"></p>
+      <div class="form-actions"><button id="rename-cancel" class="text-button" type="button">Cancel</button><button class="save-button" type="submit">Save name</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="lightbox" class="lightbox">
+    <button id="lightbox-close" class="icon-button lightbox-close" aria-label="Close media">×</button>
+    <button id="previous" class="nav-button previous" aria-label="Previous item">‹</button>
+    <div class="zoom-controls" aria-label="Image zoom controls">
+      <button id="zoom-out" class="icon-button" type="button" aria-label="Zoom out">−</button>
+      <button id="zoom-reset" class="zoom-level" type="button" aria-label="Reset zoom">100%</button>
+      <button id="zoom-in" class="icon-button" type="button" aria-label="Zoom in">+</button>
+    </div>
+    <figure id="image-stage"><img id="full-image" alt="" draggable="false"><video id="full-video" controls playsinline muted preload="none" hidden></video><p id="video-error" role="alert" hidden>Unable to play this video. Try downloading the original.</p><a id="download-original" hidden>Download original WebM</a><figcaption id="caption"></figcaption></figure>
+    <button id="next" class="nav-button next" aria-label="Next item">›</button>
+  </dialog>
+  <script src="/app.js"></script>
+</body>
+</html>
