@@ -1,0 +1,91 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const tags = require('../tags');
+const collections = require('../collections');
+const backup = require('../metadata-backup');
+
+test('metadata backup restores missing tags and collection identities without touching media', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-backup-test-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const original = path.join(root, 'original'), target = path.join(root, 'recovered');
+  const g1 = path.join(original, 'Gallery'), g2 = path.join(target, 'Gallery');
+  await fs.mkdir(path.join(g1, 'Album'), { recursive: true });
+  await fs.writeFile(path.join(g1, 'Album', 'one.jpg'), 'original image');
+  await fs.writeFile(path.join(g1, 'Album', '.imageworks-manual.json'), JSON.stringify({ version:1 }));
+  await fs.writeFile(path.join(g1, 'Album', '.imageworks-cover.json'), JSON.stringify({ path:'one.jpg' }));
+  const tag = await tags.createTag(original, 'Portraits');
+  await tags.colourTag(original, tag.id, 'blue');
+  await tags.assignTags(original, g1, 'Album', [tag.id]);
+  await collections.add(original, g1, 'favourites', 'Album', 'one.jpg');
+  const data = await backup.capture(original, g1, path.join(original, 'Trash'));
+  await fs.mkdir(path.join(g2, 'Album'), { recursive: true });
+  await fs.writeFile(path.join(g2, 'Album', 'one.jpg'), 'original image');
+  const plan = await backup.plan(target, g2, path.join(target, 'Trash'), data);
+  assert.equal(plan.conflicts.length, 0); assert.deepEqual(plan.matchedByName, ['Album']); assert.equal(plan.writes.length, 6);
+  assert.equal((await backup.restore(target, g2, path.join(target, 'Trash'), data)).restored, 6);
+  assert.deepEqual((await tags.library(target)).map(x => x.name), ['Portraits']);
+  assert.equal((await tags.library(target))[0].colour, 'blue');
+  assert.deepEqual(await tags.galleryTags(path.join(g2, 'Album')), [tag.id]);
+  assert.equal((await collections.detail(target, g2, path.join(target, 'Trash'), 'favourites')).items[0].state, 'available');
+  assert.equal(await fs.readFile(path.join(g2, 'Album', 'one.jpg'), 'utf8'), 'original image');
+  assert.equal(JSON.parse(await fs.readFile(path.join(g2, 'Album', '.imageworks-cover.json'), 'utf8')).path, 'one.jpg');
+  assert.equal(JSON.parse(await fs.readFile(path.join(g2, 'Album', '.imageworks-manual.json'), 'utf8')).version, 1);
+  assert.equal((await backup.plan(target, g2, path.join(target, 'Trash'), data)).writes.length, 0);
+  await tags.createTag(target, 'New tag');
+  const conflict = await backup.plan(target, g2, path.join(target, 'Trash'), data);
+  assert.match(conflict.conflicts.join(' '), /Shared tag library/);
+  await assert.rejects(backup.restore(target, g2, path.join(target, 'Trash'), data), /blocked/);
+  assert.equal((await tags.library(target)).length, 2);
+});
+
+test('metadata restore rejects traversal and reports missing galleries', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-backup-test-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.mkdir(path.join(root, 'Gallery'));
+  const empty = { format:'imageworks-metadata', version:1, tags:null, collections:null, galleries:[{ kind:'gallery', name:'Missing', trashId:null, galleryId:null, tagIds:[] }] };
+  const result = await backup.plan(root, path.join(root, 'Gallery'), path.join(root, 'Trash'), empty);
+  assert.deepEqual(result.missing, ['Missing']);
+  empty.galleries[0].name = '../outside';
+  await assert.rejects(backup.plan(root, path.join(root, 'Gallery'), path.join(root, 'Trash'), empty), /Invalid gallery/);
+});
+
+test('metadata backup includes a trashed gallery and restores its identity into Trash', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-backup-trash-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const trash = require('../gallery-trash');
+  const original = path.join(root, 'original'), target = path.join(root, 'recovered');
+  const g1 = path.join(original, 'Gallery'), b1 = path.join(original, 'Trash');
+  const g2 = path.join(target, 'Gallery'), b2 = path.join(target, 'Trash');
+  await fs.mkdir(path.join(g1, 'Album'), { recursive: true });
+  await fs.writeFile(path.join(g1, 'Album', 'one.jpg'), 'image');
+  await collections.add(original, g1, 'favourites', 'Album', 'one.jpg');
+  const moved = await trash.moveToTrash(g1, b1, 'Album');
+  const data = await backup.capture(original, g1, b1);
+  assert.equal(data.galleries[0].kind, 'trash');
+  await fs.mkdir(g2, { recursive: true });
+  await fs.mkdir(path.join(b2, moved.id, 'gallery'), { recursive: true });
+  await fs.writeFile(path.join(b2, moved.id, 'info.json'), JSON.stringify({ name:'Album', trashedAt:moved.trashedAt }));
+  await fs.writeFile(path.join(b2, moved.id, 'gallery', 'one.jpg'), 'image');
+  assert.equal((await backup.restore(target, g2, b2, data)).restored, 2);
+  assert.equal((await collections.detail(target, g2, b2, 'favourites')).items[0].state, 'trashed');
+  await trash.restoreTrash(g2, b2, moved.id);
+  assert.equal((await collections.detail(target, g2, b2, 'favourites')).items[0].state, 'available');
+});
+
+test('empty manually created galleries retain their marker through recovery', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-blank-backup-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const media = require('../gallery-media');
+  const original = path.join(root, 'original'), target = path.join(root, 'target');
+  const g1 = path.join(original, 'Gallery'), g2 = path.join(target, 'Gallery');
+  await fs.mkdir(g1, { recursive: true });
+  await media.createGallery(g1, 'Empty');
+  const data = await backup.capture(original, g1, path.join(original, 'Trash'));
+  assert.equal(data.galleries[0].manual, true);
+  await fs.mkdir(path.join(g2, 'Empty'), { recursive: true });
+  assert.equal((await backup.restore(target, g2, path.join(target, 'Trash'), data)).restored, 1);
+  assert.equal(await media.manualGallery(path.join(g2, 'Empty')), true);
+});

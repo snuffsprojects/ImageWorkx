@@ -4,6 +4,7 @@ const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { promisify } = require('node:util');
 const execFile = promisify(require('node:child_process').execFile);
+const galleryMedia = require('./gallery-media');
 
 async function sha256(file) {
   const hash = createHash('sha256');
@@ -31,6 +32,7 @@ async function createPilot({ galleryRoot, dataRoot, albumId, onProgress = () => 
       }
     }
     await collect(source);
+    try { await fs.copyFile(path.join(source, '.imageworks-tags.json'), path.join(staging, '.imageworks-tags.json'), fs.constants.COPYFILE_EXCL); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     const jpgCount = files.filter(name => /\.jpe?g$/i.test(name)).length;
     if (!jpgCount) throw new Error('This gallery has no JPEG images to convert.');
     let done = 0, inputBytes = 0, outputBytes = 0;
@@ -50,6 +52,14 @@ async function createPilot({ galleryRoot, dataRoot, albumId, onProgress = () => 
       inputBytes += stat.size;
       outputBytes += (await fs.stat(output)).size;
       onProgress({ done: ++done, total: jpgCount, inputBytes, outputBytes });
+    }
+    const cover = await galleryMedia.readCover(source);
+    if (cover) {
+      const pilotCover = /\.jpe?g$/i.test(cover) ? `${cover}.jxl` : cover;
+      try {
+        const stat = await fs.lstat(path.join(staging, pilotCover));
+        if (stat.isFile()) await fs.writeFile(path.join(staging, galleryMedia.COVER), JSON.stringify({ path: pilotCover }), { flag: 'wx' });
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     let name = `${albumId} [JPEG XL pilot]`;
     for (let n = 2; ; n++) {

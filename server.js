@@ -7,6 +7,11 @@ const { createPosterCache, fallbackPoster, parseRange } = require('./video');
 const { createPreviewCache, cleanPreviews } = require('./previews');
 const { readActivity } = require('./activity');
 const { createPilot } = require('./jpeg-xl-pilot');
+const tags = require('./tags');
+const collections = require('./collections');
+const galleryMedia = require('./gallery-media');
+const imageTrash = require('./image-trash');
+const metadataBackup = require('./metadata-backup');
 const { moveToTrash, listTrash, restoreTrash, deleteTrash } = require('./gallery-trash');
 const { listDownloadCache, removeDownloadCache } = require('./download-cache');
 
@@ -17,6 +22,7 @@ const PROCESSED = path.join(DATA_ROOT, 'Processed');
 const { planMove, executeMove } = require('./processed-archives');
 const GALLERY = path.join(DATA_ROOT, 'Gallery');
 const TRASH = path.join(DATA_ROOT, '.gallery-trash');
+const IMAGE_TRASH = path.join(DATA_ROOT, '.imageworks-image-trash');
 const getPoster = createPosterCache(path.join(DATA_ROOT, '.posters'));
 const PREVIEW_CACHE = path.join(DATA_ROOT, '.previews');
 const getPreview = createPreviewCache(PREVIEW_CACHE);
@@ -179,13 +185,13 @@ function run7zip(archive, destination) {
   });
 }
 
-async function uniqueDestination(target) {
-  if (!await exists(target)) return target;
+async function uniqueDestination(target, reserved = new Set()) {
+  if (!reserved.has(target) && !await exists(target)) return target;
   const ext = path.extname(target);
   const stem = target.slice(0, -ext.length);
   for (let n = 2; ; n++) {
     const candidate = `${stem} (${n})${ext}`;
-    if (!await exists(candidate)) return candidate;
+    if (!reserved.has(candidate) && !await exists(candidate)) return candidate;
   }
 }
 
@@ -202,17 +208,23 @@ async function importArchive(archive) {
     const images = await walkImages(tempDir);
     if (!images.length) throw new Error('The archive did not contain any supported media files.');
     await fsp.mkdir(albumDir, { recursive: true });
+    const galleryId = await collections.readGalleryId(albumDir);
+    const reserved = await imageTrash.reservedPaths(IMAGE_TRASH, galleryId);
+    const reservedFiles = new Set([...reserved].map(item => path.join(albumDir, ...item.split('/'))));
+    let added = 0;
     for (const image of images) {
       const relative = path.relative(tempDir, image);
+      if (reserved.has(relative.split(path.sep).join('/'))) continue;
       const requested = path.join(albumDir, relative);
-      const destination = await uniqueDestination(requested);
+      const destination = await uniqueDestination(requested, reservedFiles);
       await fsp.mkdir(path.dirname(destination), { recursive: true });
       await fsp.copyFile(image, destination);
+      added++;
     }
     invalidateSummary();
-    activity = { status: 'success', message: `Added ${images.length} file${images.length === 1 ? '' : 's'} to ${albumName}`, archive: path.basename(archive), updatedAt: new Date().toISOString() };
-    log('info', 'archive.import_completed', { archive, album: albumName, images: images.length, durationMs: Date.now() - started });
-    return images.length;
+    activity = { status: 'success', message: `Added ${added} file${added === 1 ? '' : 's'} to ${albumName}`, archive: path.basename(archive), updatedAt: new Date().toISOString() };
+    log('info', 'archive.import_completed', { archive, album: albumName, images: added, durationMs: Date.now() - started });
+    return added;
   } catch (error) {
     activity = { status: 'error', message: `${path.basename(archive)}: ${error.message}`, archive: path.basename(archive), updatedAt: new Date().toISOString() };
     throw error;
@@ -282,19 +294,24 @@ async function getAlbums({ id, summary = false } = {}) {
     if (!entry.isDirectory() || (id !== undefined && entry.name !== id)) continue;
     const dir = path.join(GALLERY, entry.name);
     const images = await walkImages(dir);
-    if (!images.length) continue;
+    if (!images.length && !await galleryMedia.manualGallery(dir) && !await collections.readGalleryId(dir)) continue;
     const items = await Promise.all(images.map(async file => {
       const stat = await fsp.stat(file);
       const relative = path.relative(GALLERY, file).split(path.sep).map(encodeURIComponent).join('/');
-      return { name: path.basename(file).replace(/\.jxl$/i, ''), preview: path.extname(file).toLowerCase() === '.webm' ? null : `/preview/${relative}`, type: path.extname(file).toLowerCase() === '.webm' ? 'video' : 'image', poster: path.extname(file).toLowerCase() === '.webm' ? `/poster/${relative}` : null, url: path.extname(file).toLowerCase() === '.jxl' ? `/reconstructed/${relative}` : `/gallery/${relative}`, jxl: path.extname(file).toLowerCase() === '.jxl', sizeBytes: stat.size, modifiedAt: stat.mtime.toISOString() };
+      return { name: path.basename(file).replace(/\.jxl$/i, ''), relativePath: path.relative(dir, file).split(path.sep).join('/'), preview: path.extname(file).toLowerCase() === '.webm' ? null : `/preview/${relative}`, type: path.extname(file).toLowerCase() === '.webm' ? 'video' : 'image', poster: path.extname(file).toLowerCase() === '.webm' ? `/poster/${relative}` : null, url: path.extname(file).toLowerCase() === '.jxl' ? `/reconstructed/${relative}` : `/gallery/${relative}`, jxl: path.extname(file).toLowerCase() === '.jxl', sizeBytes: stat.size, modifiedAt: stat.mtime.toISOString() };
     }));
     items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-    const modifiedAt = items.reduce((latest, item) => item.modifiedAt > latest ? item.modifiedAt : latest, items[0].modifiedAt);
+    const modifiedAt = items.length ? items.reduce((latest, item) => item.modifiedAt > latest ? item.modifiedAt : latest, items[0].modifiedAt) : (await fsp.stat(dir)).mtime.toISOString();
+    let coverPath = null;
+    try { coverPath = await galleryMedia.readCover(dir); } catch (error) { log('error', 'gallery.cover_read_failed', { album: entry.name, error }); }
+    const coverItem = items.find(item => item.relativePath === coverPath && item.type === 'image') || items[0];
     const source = await readAlbumSource(dir, entry.name);
+    let tagIds = [], tagError = false;
+    try { tagIds = await tags.galleryTags(dir); } catch (error) { tagError = true; log('error', 'tags.gallery_read_failed', { album: entry.name, error }); }
     const details = source?.type === '4chan'
       ? { name: entry.name, model: '', set: source.title || `Thread ${source.threadId}` }
       : albumDetails(entry.name);
-    albums.push({ id: entry.name, ...details, kind: source?.type || 'collection', source, count: items.length, sizeBytes: items.reduce((sum, item) => sum + item.sizeBytes, 0), cover: items[0].poster || items[0].preview || items[0].url, coverType: items[0].type, modifiedAt, ...(summary ? {} : { images: items }) });
+    albums.push({ id: entry.name, ...details, kind: source?.type || 'collection', source, tagIds, tagError, count: items.length, sizeBytes: items.reduce((sum, item) => sum + item.sizeBytes, 0), cover: coverItem ? coverItem.poster || coverItem.preview || coverItem.url : null, coverType: coverItem?.type || null, modifiedAt, ...(summary ? {} : { images: items }) });
   }
   return albums.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
 }
@@ -329,15 +346,19 @@ async function copyDownloadedImages(sourceDir, targetDir, includeWebm = false) {
   await fsp.mkdir(targetDir, { recursive: true });
   let added = 0;
   let skipped = 0;
+  const galleryId = await collections.readGalleryId(targetDir);
+  const reserved = await imageTrash.reservedPaths(IMAGE_TRASH, galleryId);
+  const reservedFiles = new Set([...reserved].map(item => path.join(targetDir, ...item.split('/'))));
   for (const image of images) {
     const relative = path.relative(sourceDir, image);
+    if (reserved.has(relative.split(path.sep).join('/'))) { skipped++; continue; }
     const requested = path.join(targetDir, relative);
     await fsp.mkdir(path.dirname(requested), { recursive: true });
     if (await exists(requested)) {
       const [sourceStat, targetStat] = await Promise.all([fsp.stat(image), fsp.stat(requested)]);
       if (sourceStat.size === targetStat.size) { skipped++; continue; }
     }
-    const destination = await uniqueDestination(requested);
+    const destination = await uniqueDestination(requested, reservedFiles);
     await fsp.copyFile(image, destination);
     added++;
   }
@@ -406,15 +427,17 @@ async function startDownload(req, res) {
   return sendJson(res, 202, { download: downloadJob });
 }
 
-async function readJson(req) {
+async function readJson(req, maxLength = 4096) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    let body = '', tooLarge = false;
     req.setEncoding('utf8');
     req.on('data', chunk => {
+      if (tooLarge) return;
+      if (body.length + chunk.length > maxLength) { body = ''; tooLarge = true; return; }
       body += chunk;
-      if (body.length > 4096) reject(new Error('Request is too large.'));
     });
     req.on('end', () => {
+      if (tooLarge) return reject(new Error('Request is too large.'));
       try { resolve(JSON.parse(body || '{}')); } catch { reject(new Error('Invalid request.')); }
     });
     req.on('error', reject);
@@ -432,11 +455,12 @@ async function renameAlbum(req, res) {
   const newDir = path.join(GALLERY, newName);
   if (!oldDir || path.dirname(oldDir) !== GALLERY || !(await exists(oldDir))) return sendJson(res, 404, { error: 'Gallery not found.' });
   if (oldDir.toLowerCase() === newDir.toLowerCase()) {
-    if (oldDir !== newDir) { await fsp.rename(oldDir, newDir); invalidateSummary(); }
+    if (oldDir !== newDir) { await fsp.rename(oldDir, newDir); await collections.noteRenamed(DATA_ROOT, newDir, newName).catch(error => log('error', 'collections.rename_update_failed', { error })); invalidateSummary(); }
     return sendJson(res, 200, { album: albumDetails(newName) });
   }
   if (await exists(newDir)) return sendJson(res, 409, { error: 'A gallery with that name already exists.' });
   await fsp.rename(oldDir, newDir);
+  await collections.noteRenamed(DATA_ROOT, newDir, newName).catch(error => log('error', 'collections.rename_update_failed', { error }));
   invalidateSummary();
   activity = { status: 'success', message: `Renamed gallery to ${newName}`, archive: null, updatedAt: new Date().toISOString() };
   return sendJson(res, 200, { album: albumDetails(newName) });
@@ -517,7 +541,7 @@ async function directorySize(dir) {
 }
 
 async function storageInfo() {
-  const folders = { inbox: INBOX, processed: PROCESSED, downloads: DOWNLOAD_CACHE, trash: TRASH, previews: PREVIEW_CACHE, posters: path.join(DATA_ROOT, '.posters') };
+  const folders = { inbox: INBOX, processed: PROCESSED, downloads: DOWNLOAD_CACHE, trash: TRASH, imageTrash: IMAGE_TRASH, previews: PREVIEW_CACHE, posters: path.join(DATA_ROOT, '.posters') };
   const sizes = {};
   for (const [name, dir] of Object.entries(folders)) sizes[name] = await directorySize(dir);
   sizes.gallery = (await getSummary()).reduce((sum, album) => sum + album.sizeBytes, 0);
@@ -548,6 +572,115 @@ async function handleRequest(req, res) {
   if (req.method === 'POST' && req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) return sendJson(res, 403, { error: 'Origin not allowed.' });
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (url.pathname === '/api/albums') return sendJson(res, 200, { albums: await (url.searchParams.get('summary') === '1' && !url.searchParams.has('id') ? getSummary() : getAlbums({ id: url.searchParams.has('id') ? url.searchParams.get('id') : undefined, summary: url.searchParams.get('summary') === '1' })), activity });
+
+  if (url.pathname === '/api/albums/create' && req.method === 'POST') {
+    const body = await readJson(req);
+    if (typeof body.name !== 'string' || !body.name.trim() || Buffer.byteLength(body.name.trim()) > 150) return sendJson(res, 400, { error: 'Enter a gallery name (up to 150 bytes).' });
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      const name = normalizeAlbumName(body.name);
+      await galleryMedia.createGallery(GALLERY, name); invalidateSummary();
+      log('info', 'gallery.created', { album: name });
+      return sendJson(res, 201, { id: name });
+    } catch (error) { return sendJson(res, error.code === 'EEXIST' ? 409 : 400, { error: error.code === 'EEXIST' ? 'A gallery with that name already exists.' : error.message }); }
+    finally { galleryTrashRunning = false; }
+  }
+  if (url.pathname === '/api/albums/upload' && req.method === 'POST') {
+    const album = url.searchParams.get('id'), name = url.searchParams.get('name'), rawLength = req.headers['content-length'];
+    if (!/^\d+$/.test(rawLength || '') || !Number.isSafeInteger(Number(rawLength)) || Number(rawLength) < 1 || Number(rawLength) > galleryMedia.MAX_UPLOAD) { req.resume(); return sendJson(res, 400, { error: 'Images must be between 1 byte and 100 MB and include their size.' }); }
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') { req.resume(); return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' }); }
+    galleryTrashRunning = true;
+    try {
+      const dir = await galleryMedia.albumDirectory(GALLERY, album);
+      const reserved = await imageTrash.reservedPaths(IMAGE_TRASH, await collections.readGalleryId(dir));
+      const result = await galleryMedia.upload(GALLERY, album, name, Number(rawLength), req, reserved);
+      invalidateSummary(); log('info', 'gallery.image_uploaded', { album, file: result.name, sizeBytes: result.sizeBytes });
+      return sendJson(res, 201, result);
+    } catch (error) {
+      log('error', 'gallery.upload_failed', { album, error });
+      if (!req.destroyed) req.resume();
+      if (!res.destroyed) return sendJson(res, 400, { error: error.code === 'ENOENT' ? 'Gallery not found.' : error.message });
+    } finally { galleryTrashRunning = false; }
+  }
+  if (url.pathname === '/api/albums/cover' && req.method === 'POST') {
+    const body = await readJson(req);
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      const dir = await galleryMedia.albumDirectory(GALLERY, body.id);
+      await galleryMedia.setCover(GALLERY, body.id, body.path, await walkImages(dir));
+      invalidateSummary(); log('info', 'gallery.cover_changed', { album: body.id });
+      return sendJson(res, 200, { ok: true });
+    } catch (error) { return sendJson(res, 400, { error: error.code === 'ENOENT' ? 'Gallery not found.' : error.message }); }
+    finally { galleryTrashRunning = false; }
+  }
+  if (url.pathname === '/api/metadata-backup' && req.method === 'GET') {
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      const data = await metadataBackup.capture(DATA_ROOT, GALLERY, TRASH);
+      const body = JSON.stringify(data, null, 2);
+      if (Buffer.byteLength(body) > 20 * 1024 * 1024) return sendJson(res, 413, { error: 'Metadata backup exceeds the 20 MB restore limit.' });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="imageworks-metadata-backup.json"', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
+      return res.end(body);
+    } finally { galleryTrashRunning = false; }
+  }
+  if (['/api/metadata-restore/preview', '/api/metadata-restore/apply'].includes(url.pathname) && req.method === 'POST') {
+    let body; try { body = await readJson(req, 20 * 1024 * 1024); } catch (error) { return sendJson(res, 400, { error: error.message }); }
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      if (url.pathname.endsWith('/preview')) {
+        const result = await metadataBackup.plan(DATA_ROOT, GALLERY, TRASH, body);
+        return sendJson(res, 200, { filesToRestore: result.writes.length, conflicts: result.conflicts, missing: result.missing, matchedByName: result.matchedByName });
+      }
+      const result = await metadataBackup.restore(DATA_ROOT, GALLERY, TRASH, body);
+      invalidateSummary(); log('info', 'metadata.restored', { files: result.restored, missing: result.missing.length });
+      return sendJson(res, 200, result);
+    } catch (error) { return sendJson(res, 400, { error: error.message }); }
+    finally { galleryTrashRunning = false; }
+  }
+  if (url.pathname === '/api/collections' && req.method === 'GET') {
+    if (url.searchParams.has('id')) {
+      try { return sendJson(res, 200, { collection: await collections.detail(DATA_ROOT, GALLERY, TRASH, url.searchParams.get('id'), await imageTrash.references(IMAGE_TRASH)) }); }
+      catch (error) { return sendJson(res, 400, { error: error.message }); }
+    }
+    const all = await collections.read(DATA_ROOT);
+    return sendJson(res, 200, { collections: all.map(c => ({ id: c.id, name: c.name, count: c.items.length })) });
+  }
+  if (['/api/collections/create', '/api/collections/add', '/api/collections/add-many', '/api/collections/remove', '/api/collections/delete'].includes(url.pathname) && req.method === 'POST') {
+    const body = await readJson(req, url.pathname.endsWith('/add-many') ? 262144 : 4096);
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      let result;
+      if (url.pathname.endsWith('/create')) result = await collections.create(DATA_ROOT, body.name);
+      else if (url.pathname.endsWith('/add')) result = await collections.add(DATA_ROOT, GALLERY, body.collection, body.album, body.path);
+      else if (url.pathname.endsWith('/add-many')) result = await collections.addMany(DATA_ROOT, GALLERY, body.collection, body.album, body.paths);
+      else if (url.pathname.endsWith('/remove')) result = await collections.remove(DATA_ROOT, body.collection, body.item);
+      else result = await collections.removeCollection(DATA_ROOT, body.collection);
+      return sendJson(res, 200, { result });
+    } catch (error) { return sendJson(res, 400, { error: error.code === 'ENOENT' ? 'Gallery or image not found.' : error.message }); }
+    finally { galleryTrashRunning = false; }
+  }
+  if (url.pathname === '/api/tags' && req.method === 'GET') return sendJson(res, 200, { tags: await tags.library(DATA_ROOT) });
+  if (['/api/tags/create', '/api/tags/rename', '/api/tags/colour', '/api/tags/delete', '/api/tags/assign'].includes(url.pathname) && req.method === 'POST') {
+    const body = await readJson(req);
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      let tag;
+      if (url.pathname.endsWith('/create')) tag = await tags.createTag(DATA_ROOT, body.name);
+      else if (url.pathname.endsWith('/rename')) tag = await tags.changeTag(DATA_ROOT, body.id, body.name);
+      else if (url.pathname.endsWith('/colour')) tag = await tags.colourTag(DATA_ROOT, body.id, body.colour);
+      else if (url.pathname.endsWith('/delete')) tag = await tags.changeTag(DATA_ROOT, body.id, null);
+      else await tags.assignTags(DATA_ROOT, GALLERY, body.album, body.ids);
+      invalidateSummary();
+      return sendJson(res, 200, { tag, tags: await tags.library(DATA_ROOT) });
+    } catch (error) { return sendJson(res, 400, { error: error.code === 'ENOENT' ? 'Gallery not found.' : error.message }); }
+    finally { galleryTrashRunning = false; }
+  }
   if (url.pathname === '/api/jxl-pilot' && req.method === 'GET') return sendJson(res, 200, { pilot: pilotJob });
   if (url.pathname === '/api/jxl-pilot' && req.method === 'POST') {
     const body = await readJson(req);
@@ -558,6 +691,27 @@ async function handleRequest(req, res) {
       .then(result => { pilotJob = { status: 'success', ...result }; invalidateSummary(); log('info', 'jxl.pilot_completed', result); })
       .catch(error => { pilotJob = { status: 'error', message: error.code === 'ENOENT' && error.path && /(?:cjxl|djxl)$/.test(error.path) ? 'Install libjxl-tools to use the pilot.' : error.message }; log('error', 'jxl.pilot_failed', { error }); });
     return sendJson(res, 202, { pilot: pilotJob });
+  }
+  if (url.pathname === '/api/image-trash' && req.method === 'GET') return sendJson(res, 200, { entries: await imageTrash.list(IMAGE_TRASH, GALLERY, TRASH) });
+  if (url.pathname === '/api/image-trash/file' && req.method === 'GET') {
+    try { const item = await imageTrash.file(IMAGE_TRASH, url.searchParams.get('id')); return serveFile(req, res, item.dir, 'media'); }
+    catch (error) { return sendJson(res, 404, { error: error.message }); }
+  }
+  if (['/api/image-trash/move', '/api/image-trash/restore', '/api/image-trash/delete', '/api/image-trash/forget'].includes(url.pathname) && req.method === 'POST') {
+    const body = await readJson(req);
+    if (galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working') return sendJson(res, 409, { error: 'Wait for the current import, download or gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      let result;
+      if (url.pathname.endsWith('/move')) result = await imageTrash.move(GALLERY, IMAGE_TRASH, body.album, body.path);
+      else if (url.pathname.endsWith('/restore')) result = await imageTrash.restore(GALLERY, TRASH, IMAGE_TRASH, body.id);
+      else if (url.pathname.endsWith('/delete')) result = await imageTrash.deleteMedia(IMAGE_TRASH, body.id);
+      else result = await imageTrash.forget(IMAGE_TRASH, body.id);
+      invalidateSummary();
+      log('info', `image.trash_${url.pathname.split('/').at(-1)}`, { album: result.sourceName, file: path.basename(result.path) });
+      return sendJson(res, 200, { ok: true });
+    } catch (error) { return sendJson(res, 400, { error: error.code === 'ENOENT' ? 'Gallery or image not found.' : error.message }); }
+    finally { galleryTrashRunning = false; }
   }
   if (url.pathname === '/api/gallery-trash' && req.method === 'GET') return sendJson(res, 200, { entries: await listTrash(TRASH) });
   if (['/api/gallery-trash/move', '/api/gallery-trash/restore', '/api/gallery-trash/delete'].includes(url.pathname) && req.method === 'POST') {

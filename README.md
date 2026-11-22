@@ -60,6 +60,22 @@ Gallery summaries are shared in memory between browsers and refreshed after impo
 
 Gallery tiles and covers use previews generated on demand with FFmpeg and stored in `.previews` outside Gallery. The full-screen viewer uses the original file. If preview generation fails, the original is displayed instead. Previews older than 30 days are cleaned up daily and regenerated when needed.
 
+## Favourites and collections
+
+Open an image or video in a gallery and choose **Favourite** or **Add to collection**. Create custom collections on the **Collections** tab or while adding an image. Each item shows its filename and source gallery; selecting the source opens that gallery. Collections use the same files-per-page preference as gallery views. A collection holds references, not duplicate media files. Use **Remove from collection** on a collection card or in its viewer to remove only the reference; the source file stays in its gallery. Deleting a collection also keeps source files. To move an original file to Image Trash, open its source gallery and choose **Trash original**. Use **Select images** in a gallery to select up to 500 files across pages and add them together. Favourites is always available and cannot itself be deleted.
+
+References follow gallery renames and moves to Trash. Items whose gallery is in Trash show a placeholder and reappear if it is restored; missing files and duplicate gallery identities also show placeholders, which can be removed from the collection. Permanent deletion of the source leaves a missing placeholder. Renames or file moves made outside ImageWorkx may temporarily show a prior source name when the source is missing. Back up the central `.imageworks-collections.json` in the data directory and the hidden `.imageworks-gallery-id` files within galleries and Trash alongside your media. Deleting or copying those identity files can cause missing or duplicate-identity placeholders.
+
+## Gallery tags
+
+Open a gallery and choose **Tags** to select existing tags or create new ones. Tags can be reused across galleries. Use **Filter by tag** on the gallery page to show one tag or untagged galleries. In the tag picker, **Manage shared tags** can rename or delete tags across all galleries, including galleries in Trash; removing a selection and choosing Done affects only the open gallery. New tags join the library immediately, even if you cancel the gallery selection. Tags can be given an optional shared colour in **Manage shared tags**. Tags follow galleries through renaming and Trash, and JPEG XL pilot copies inherit them. The shared library is stored in `.imageworks-tags.json` in the data directory; each gallery stores its assignments in its own `.imageworks-tags.json`. Back up both to retain tags.
+
+## Metadata backup and recovery
+
+Use **Storage → Tags and collections backup** to download a JSON backup of the tag library, collections and gallery metadata, including identities, custom covers and manually created gallery markers for galleries in Trash. This file contains gallery and image names, but not the images, videos, archives, cache files, Image Trash records or 4chan source details. Store it separately and back up media separately. Backups are manual; ImageWorkx does not schedule them.
+
+For recovery, select a backup and choose **Preview restore**. The preview lists missing galleries, folders matched by name, and any conflicting metadata. Check that name-matched folders contain the original galleries before restoring: names alone cannot prove identity. Restore fills missing metadata only; it refuses to overwrite any different existing metadata and requires a filesystem that supports hard links. A gallery that cannot be matched is skipped, and collection entries can remain placeholders until the source is recovered. If an I/O error interrupts restoration, some missing files may have been restored; review and retry. A backup can be at most 20 MB. Metadata is not included in the GitHub source backup.
+
 ## JPEG XL pilot
 
 Install `libjxl-tools` on the ImageWorkx server (`sudo apt-get install libjxl-tools`). Open a gallery and select **JPEG XL pilot** to create a separate gallery. JPG and JPEG files are converted using reversible JPEG recompression and checked by reconstructing and hashing the complete original. Other supported media, including WebP and WebM, are copied unchanged. The original gallery is kept, so a pilot uses additional storage; it does not save disk space until a separate, deliberate migration is implemented. The pilot does not carry thread update metadata or unsupported files.
@@ -69,6 +85,12 @@ The pilot appears in the gallery once all files pass verification. ImageWorkx cr
 ## Gallery Trash
 
 Open a gallery and choose **Move to Trash**. The entire gallery folder is moved to `.gallery-trash` under the ImageWorkx data folder, including any nested files and gallery metadata. It can be restored or permanently deleted from **Storage → Gallery Trash**. Trash uses disk space until permanently deleted and is not automatically emptied. Restoring refuses to replace a gallery with the same name. Archive files in Processed and download cache entries are separate and remain untouched. Gallery moves, restores and permanent deletions wait until imports, downloads and JPEG XL pilots are idle.
+
+## Image Trash
+
+Open an image or video and choose **Trash** to move that file out of its gallery. Restore or permanently delete it under **Storage → Image Trash**; the stored file can also be downloaded if its source gallery is unavailable. Restoring requires the original gallery and will not overwrite a file at the same path. If the gallery itself is in Trash, restore the gallery first. A removed cover falls back to another image and returns when restored, unless you have selected a new cover in the meantime. Collection entries show a placeholder while the file is in Trash or permanently deleted.
+
+A small deletion record remains after permanent deletion to prevent archive imports or thread updates from silently reintroducing the same path. Uploading a file with the same name chooses a different name. Use **Allow re-import** to remove a deletion record; any remaining collection references may then link to a future file at that path. Archives, download cache and preview copies are separate and are not erased when the gallery file is deleted. Back up the whole ImageWorkx data directory, including `.imageworks-image-trash`, to retain Image Trash and deletion records; the metadata-only backup does not include them.
 
 ## Storage usage
 

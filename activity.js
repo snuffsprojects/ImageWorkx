@@ -12,9 +12,10 @@ async function readActivity(directory, limit = 200) {
     for (let i = lines.length - 1; i >= 0 && result.length < limit; i--) {
       let row;
       try { row = JSON.parse(lines[i]); } catch { continue; }
-      if (!row.timestamp || !(row.level === 'error' || ['service.started', 'archive.import_started', 'archive.import_completed', 'archive.moved_to_processed', 'download.started', 'download.completed', 'gallery.trash_move', 'gallery.trash_restore', 'gallery.trash_delete'].includes(row.event))) continue;
+      if (!row.timestamp || !(row.level === 'error' || ['service.started', 'archive.import_started', 'archive.import_completed', 'archive.moved_to_processed', 'download.started', 'download.completed', 'gallery.trash_move', 'gallery.trash_restore', 'gallery.trash_delete', 'gallery.created', 'gallery.image_uploaded', 'gallery.cover_changed', 'image.trash_move', 'image.trash_restore', 'image.trash_delete', 'image.trash_forget'].includes(row.event))) continue;
       result.push({ timestamp: row.timestamp, level: row.level, event: row.event,
         archive: typeof row.archive === 'string' ? path.basename(row.archive) : undefined,
+        file: typeof row.file === 'string' ? path.basename(row.file) : undefined,
         album: row.album, images: row.images, added: row.added,
         message: typeof row.error?.message === 'string' ? row.error.message.slice(0, 2000) : undefined,
         retryInSeconds: row.retryInSeconds });

@@ -1,0 +1,90 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const collections = require('../collections');
+const trash = require('../gallery-trash');
+
+test('collections refer to originals and survive gallery rename, trash and restore', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-collections-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const gallery = path.join(root, 'Gallery'), bin = path.join(root, 'Trash');
+  await fs.mkdir(path.join(gallery, 'Original', 'nested'), { recursive: true });
+  await fs.writeFile(path.join(gallery, 'Original', 'nested', 'photo #1.jpg'), 'image');
+  const created = await collections.create(root, ' Portraits ');
+  await assert.rejects(collections.create(root, 'portraits'), /already exists/);
+  assert.equal((await collections.add(root, gallery, created.id, 'Original', 'nested/photo #1.jpg')).alreadyAdded, false);
+  assert.equal((await collections.add(root, gallery, created.id, 'Original', 'nested/photo #1.jpg')).alreadyAdded, true);
+  await collections.add(root, gallery, 'favourites', 'Original', 'nested/photo #1.jpg');
+  let item = (await collections.detail(root, gallery, bin, created.id)).items[0];
+  assert.equal(item.state, 'available'); assert.equal(item.sourceName, 'Original'); assert.match(item.url, /photo%20%231.jpg/);
+  await fs.rename(path.join(gallery, 'Original'), path.join(gallery, 'Renamed'));
+  await collections.noteRenamed(root, path.join(gallery, 'Renamed'), 'Renamed');
+  item = (await collections.detail(root, gallery, bin, created.id)).items[0];
+  assert.equal(item.sourceName, 'Renamed'); assert.equal(item.state, 'available');
+  const moved = await trash.moveToTrash(gallery, bin, 'Renamed');
+  item = (await collections.detail(root, gallery, bin, created.id)).items[0];
+  assert.equal(item.state, 'trashed'); assert.equal(item.sourceName, 'Renamed'); assert.equal(item.url, undefined);
+  await trash.restoreTrash(gallery, bin, moved.id);
+  assert.equal((await collections.detail(root, gallery, bin, created.id)).items[0].state, 'available');
+  await fs.unlink(path.join(gallery, 'Renamed', 'nested', 'photo #1.jpg'));
+  item = (await collections.detail(root, gallery, bin, created.id)).items[0];
+  assert.equal(item.state, 'missing');
+  assert.equal(item.sourceName, 'Renamed');
+  await collections.remove(root, created.id, item.id);
+  assert.equal((await collections.detail(root, gallery, bin, created.id)).items.length, 0);
+  assert.equal((await collections.read(root)).find(c => c.id === 'favourites').items.length, 1);
+  await collections.removeCollection(root, created.id);
+  await assert.rejects(collections.removeCollection(root, 'favourites'), /cannot be deleted/);
+});
+
+test('collection sources reject traversal and symlinks and duplicated identities are not misidentified', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-collections-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const gallery = path.join(root, 'Gallery'), bin = path.join(root, 'Trash');
+  await fs.mkdir(path.join(gallery, 'One'), { recursive: true });
+  await fs.writeFile(path.join(root, 'outside.jpg'), 'private');
+  await fs.writeFile(path.join(gallery, 'One', 'real.jpg'), 'image');
+  await fs.symlink(path.join(root, 'outside.jpg'), path.join(gallery, 'One', 'link.jpg'));
+  await assert.rejects(collections.add(root, gallery, 'favourites', '../outside', 'x.jpg'));
+  await assert.rejects(collections.add(root, gallery, 'favourites', 'One', '../outside.jpg'));
+  await assert.rejects(collections.add(root, gallery, 'favourites', 'One', 'link.jpg'));
+  await collections.add(root, gallery, 'favourites', 'One', 'real.jpg');
+  await fs.cp(path.join(gallery, 'One'), path.join(gallery, 'Copy'), { recursive: true });
+  const item = (await collections.detail(root, gallery, bin, 'favourites')).items[0];
+  assert.equal(item.state, 'conflict'); assert.equal(item.url, undefined);
+});
+
+test('batch add validates every item before saving and skips duplicates', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-batch-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const gallery = path.join(root, 'Gallery');
+  await fs.mkdir(path.join(gallery, 'Album'), { recursive: true });
+  await fs.writeFile(path.join(gallery, 'Album', 'one.jpg'), 'one');
+  await fs.writeFile(path.join(gallery, 'Album', 'two.jpg'), 'two');
+  await assert.rejects(collections.addMany(root, gallery, 'favourites', 'Album', ['one.jpg', 'missing.jpg']), /nothing was added/);
+  assert.equal((await collections.read(root))[0].items.length, 0);
+  assert.deepEqual(await collections.addMany(root, gallery, 'favourites', 'Album', ['one.jpg', 'two.jpg']), { added:2, alreadyAdded:0 });
+  assert.deepEqual(await collections.addMany(root, gallery, 'favourites', 'Album', ['one.jpg', 'two.jpg']), { added:0, alreadyAdded:2 });
+  assert.equal((await collections.read(root))[0].items.length, 2);
+});
+
+test('removing an item from one collection never removes its source or other collection references', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'imageworks-collection-remove-'));
+  t.after(() => fs.rm(root, { recursive:true, force:true }));
+  const gallery = path.join(root, 'Gallery'), bin = path.join(root, 'Trash');
+  await fs.mkdir(path.join(gallery, 'Album'), { recursive:true });
+  const source = path.join(gallery, 'Album', 'photo.jpg');
+  await fs.writeFile(source, 'original image');
+  const second = await collections.create(root, 'Another collection');
+  await collections.add(root, gallery, 'favourites', 'Album', 'photo.jpg');
+  await collections.add(root, gallery, second.id, 'Album', 'photo.jpg');
+  const favourite = await collections.detail(root, gallery, bin, 'favourites');
+  await collections.remove(root, 'favourites', favourite.items[0].id);
+  assert.equal(await fs.readFile(source, 'utf8'), 'original image');
+  assert.equal((await collections.detail(root, gallery, bin, 'favourites')).items.length, 0);
+  assert.equal((await collections.detail(root, gallery, bin, second.id)).items[0].state, 'available');
+  await collections.removeCollection(root, second.id);
+  assert.equal(await fs.readFile(source, 'utf8'), 'original image');
+});

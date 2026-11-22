@@ -13,3 +13,7 @@
 /.jxl-pilot-*/
 /.jxl-work-*/
 /.gallery-trash/
+/.imageworks-tags.json*
+/.imageworks-collections.json*
+/.imageworks-restore-*.tmp
+/.imageworks-image-trash/

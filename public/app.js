@@ -7,12 +7,22 @@ const photoGrid = document.querySelector('#photo-grid');
 const renameDialog = document.querySelector('#rename-dialog');
 const downloadPage = document.querySelector('#download-page');
 const galleryPage = document.querySelector('#gallery-page');
+const collectionsPage = document.querySelector('#collections-page');
 const storagePage = document.querySelector('#storage-page');
 const activityPage = document.querySelector('#activity-page');
 let albums = [];
+let tagLibrary = [];
+let tagDraft = new Set();
+let tagEditingAlbum = null;
 let currentAlbum = null;
 let currentImages = [];
 let currentIndex = 0;
+let collectionContext = false;
+let activeCollection = null;
+let collectionPageIndex = 0;
+let collectionPickerSource = null;
+let selectingImages = false;
+let selectedImages = new Set();
 const pageSizeOptions = [15, 30, 60, 100];
 let pageSize = 15;
 try {
@@ -97,17 +107,24 @@ function renderAlbums() {
   document.querySelector('#album-count').textContent = albums.length;
   document.querySelector('#image-count').textContent = albums.reduce((sum, album) => sum + album.count, 0);
   document.querySelector('#gallery-size').textContent = formatBytes(albums.reduce((sum, album) => sum + (album.sizeBytes || 0), 0));
+  const filter = document.querySelector('#tag-filter');
+  let selectedTag = filter.value || 'all';
+  if (!['all', 'untagged'].includes(selectedTag) && !tagLibrary.some(tag => tag.id === selectedTag)) selectedTag = 'all';
+  filter.replaceChildren();
+  for (const [value, label] of [['all', 'All tags'], ['untagged', 'Untagged'], ...[...tagLibrary].sort((a, b) => a.name.localeCompare(b.name)).map(tag => [tag.id, tag.name])]) { const option = el('option', '', label); option.value = value; filter.append(option); }
+  filter.value = selectedTag;
   const query = (document.querySelector('#gallery-search').value || '').trim().toLocaleLowerCase();
   const terms = query.split(/\s+/).filter(Boolean);
   const matches = albums.filter(album => {
     const text = [album.name, album.model, album.set, album.source?.title, album.source?.board, album.source?.threadId].filter(Boolean).join(' ').toLocaleLowerCase();
-    return terms.every(term => text.includes(term));
+    const liveIds = (album.tagIds || []).filter(id => tagLibrary.some(tag => tag.id === id));
+    return terms.every(term => text.includes(term)) && (selectedTag === 'all' || (selectedTag === 'untagged' ? liveIds.length === 0 : liveIds.includes(selectedTag)));
   });
   const searchResults = document.querySelector('#search-results');
-  searchResults.hidden = !query;
+  searchResults.hidden = !query && selectedTag === 'all';
   searchResults.textContent = matches.length
     ? `${matches.length} of ${albums.length} galleries match`
-    : 'No galleries match your search. Try another name or clear the search.';
+    : 'No galleries match. Try another search or tag.';
   const collections = matches.filter(album => album.kind !== '4chan');
   const threads = matches.filter(album => album.kind === '4chan');
   document.querySelector('#collection-section').hidden = collections.length === 0;
@@ -121,14 +138,16 @@ function renderAlbums() {
     button.type = 'button';
     button.setAttribute('aria-label', `Open ${album.model ? `${album.model}, ${album.set}` : album.name}, ${album.count} files`);
     const cover = el('div', 'album-cover');
-    const image = new Image(); image.loading = 'lazy'; image.src = album.cover; image.alt = '';
-    cover.append(image);
+    if (album.cover) { const image = new Image(); image.loading = 'lazy'; image.src = album.cover; image.alt = ''; cover.append(image); }
+    else cover.append(el('span', 'empty-cover', 'Empty gallery'));
     if (album.coverType === 'video') cover.append(el('span', 'video-badge', '▶ WEBM'));
     if (isThread) cover.append(el('span', 'thread-badge', '4CHAN'));
     const meta = el('div', 'album-meta');
     if (album.model) meta.append(el('span', 'album-model', album.model));
     if (isThread) meta.append(el('span', 'thread-source', `/${album.source.board}/ · No.${album.source.threadId}`));
     meta.append(el('strong', '', album.set), el('span', '', `${album.count} file${album.count === 1 ? '' : 's'}`));
+    const matchingTags = tagLibrary.filter(tag => (album.tagIds || []).includes(tag.id));
+    if (matchingTags.length) { const chips = el('span', 'album-tags'); for (const tag of matchingTags) chips.append(tagChip(tag)); meta.append(chips); }
     button.append(cover, meta);
     button.addEventListener('click', () => openAlbum(album));
     card.append(button);
@@ -147,8 +166,10 @@ function renderAlbums() {
 }
 
 function showPage() {
-  const page = ['#download', '#storage', '#activity'].includes(location.hash) ? location.hash.slice(1) : 'gallery';
+  const page = ['#collections', '#download', '#storage', '#activity'].includes(location.hash) ? location.hash.slice(1) : 'gallery';
   galleryPage.hidden = page !== 'gallery';
+  collectionsPage.hidden = page !== 'collections';
+  if (page === 'collections') refreshCollections();
   downloadPage.hidden = page !== 'download';
   storagePage.hidden = page !== 'storage';
   activityPage.hidden = page !== 'activity';
@@ -234,11 +255,22 @@ function renderPhotoPage(page = 0) {
   const start = currentPage * pageSize;
   photoGrid.replaceChildren();
   currentImages.slice(start, start + pageSize).forEach((item, offset) => {
-    const button = el('button'); button.type = 'button'; button.setAttribute('aria-label', `View ${item.name}`);
+    const button = el('button'); button.type = 'button'; button.setAttribute('aria-label', `${selectingImages ? 'Select' : 'View'} ${item.name}`);
+    if (selectingImages) { button.classList.add('selectable'); button.setAttribute('aria-pressed', selectedImages.has(item.relativePath) ? 'true' : 'false'); }
     const image = new Image(); image.loading = 'lazy'; image.src = item.poster || item.preview || item.url; image.alt = item.name;
     button.append(image);
     if (item.type === 'video') button.append(el('span', 'video-badge', '▶ WEBM'));
-    button.addEventListener('click', () => openImage(start + offset)); photoGrid.append(button);
+    const badge = selectingImages ? el('span', 'selection-badge', selectedImages.has(item.relativePath) ? '✓' : '+') : null;
+    if (badge) button.append(badge);
+    button.addEventListener('click', () => {
+      if (!selectingImages) return openImage(start + offset);
+      if (selectedImages.has(item.relativePath)) selectedImages.delete(item.relativePath);
+      else if (selectedImages.size < 500) selectedImages.add(item.relativePath);
+      else document.querySelector('#batch-status').textContent = 'Select up to 500 files at a time.';
+      button.setAttribute('aria-pressed', selectedImages.has(item.relativePath) ? 'true' : 'false');
+      badge.textContent = selectedImages.has(item.relativePath) ? '✓' : '+';
+      updateBatchControls();
+    }); photoGrid.append(button);
   });
   setPageStatus(currentImages.length
     ? `Page ${currentPage + 1} of ${pages} · ${start + 1}–${Math.min(start + pageSize, currentImages.length)} of ${currentImages.length}`
@@ -266,6 +298,9 @@ function renderPhotoPage(page = 0) {
 }
 
 async function openAlbum(album, page = 0) {
+  if (currentAlbum?.id !== album.id) document.querySelector('#upload-status').textContent = '';
+  selectingImages = false; selectedImages = new Set(); updateBatchControls();
+  collectionContext = false;
   if (lightbox.open) lightbox.close();
   stopVideo();
   const request = ++albumRequest;
@@ -273,11 +308,15 @@ async function openAlbum(album, page = 0) {
   currentImages = [];
   renderPhotoPage();
   setPageStatus('Loading…');
+  document.querySelector('#viewer-empty').hidden = true;
   document.querySelector('#viewer-error').textContent = '';
   const viewerLabel = album.kind === '4chan' ? `4CHAN · /${album.source.board}/ · No.${album.source.threadId}` : album.model;
   document.querySelector('#viewer-model').textContent = viewerLabel;
   document.querySelector('#viewer-model').hidden = !viewerLabel;
   document.querySelector('#viewer-title').textContent = album.set;
+  document.querySelector('#edit-tags').disabled = Boolean(album.tagError);
+  if (album.tagError) document.querySelector('#viewer-error').textContent = 'Could not read this gallery’s tag metadata. Check the logs before editing tags.';
+  renderViewerTags(album);
   document.querySelector('#viewer-count').textContent = `${album.count} file${album.count === 1 ? '' : 's'}`;
   const updateButton = document.querySelector('#update-thread');
   updateButton.hidden = album.kind !== '4chan';
@@ -295,7 +334,11 @@ async function openAlbum(album, page = 0) {
     const details = data.albums[0];
     if (!details) throw new Error('This gallery is no longer available.');
     currentAlbum = details;
+    document.querySelector('#edit-tags').disabled = Boolean(details.tagError);
+    if (details.tagError) document.querySelector('#viewer-error').textContent = 'Could not read this gallery’s tag metadata. Check the logs before editing tags.';
+    renderViewerTags(details);
     currentImages = details.images;
+    document.querySelector('#viewer-empty').hidden = currentImages.length > 0;
     document.querySelector('#thread-include-webm').checked = details.source?.includeWebm === true;
     document.querySelector('#viewer-count').textContent = `${details.count} file${details.count === 1 ? '' : 's'}`;
     renderPhotoPage(page);
@@ -346,7 +389,7 @@ function openImage(index) {
   currentIndex = (index + currentImages.length) % currentImages.length;
   const item = currentImages[currentIndex];
   const page = Math.floor(currentIndex / pageSize);
-  if (page !== currentPage) renderPhotoPage(page);
+  if (!collectionContext && page !== currentPage) renderPhotoPage(page);
   stopVideo();
   resetImageView();
   viewingVideo = item.type === 'video';
@@ -370,22 +413,38 @@ function openImage(index) {
     fullImage.src = item.url;
     fullImage.alt = item.name;
   }
-  document.querySelector('#caption').textContent = `${item.name} · ${currentIndex + 1} of ${currentImages.length}`;
+  document.querySelector('#caption').textContent = `${item.name}${collectionContext ? ` · ${item.sourceName}` : ''} · ${currentIndex + 1} of ${currentImages.length}`;
+  document.querySelector('#collection-image-status').textContent = '';
+  document.querySelector('#favourite-image').disabled = false;
+  document.querySelector('#add-to-collection').disabled = false;
+  document.querySelector('#set-gallery-cover').hidden = viewingVideo;
+  document.querySelector('#trash-image').hidden = collectionContext;
+  document.querySelector('#trash-image').setAttribute('aria-label', viewingVideo ? 'Move original video to Image Trash' : 'Move original image to Image Trash');
+  document.querySelector('#remove-from-collection').hidden = !collectionContext;
+  document.querySelector('#remove-from-collection').disabled = false;
   if (!lightbox.open) lightbox.showModal();
 }
 
 async function refresh(force = false) {
   try {
-    const [albumResponse, downloadResponse] = await Promise.all([
-      fetch('/api/albums?summary=1', { cache: 'no-store' }), fetch('/api/download', { cache: 'no-store' })
+    const [albumResponse, downloadResponse, tagsResponse] = await Promise.all([
+      fetch('/api/albums?summary=1', { cache: 'no-store' }), fetch('/api/download', { cache: 'no-store' }), fetch('/api/tags', { cache: 'no-store' })
     ]);
-    if (!albumResponse.ok || !downloadResponse.ok) throw new Error('Gallery unavailable');
+    if (!albumResponse.ok || !downloadResponse.ok || !tagsResponse.ok) throw new Error('Gallery unavailable');
     const data = await albumResponse.json();
     const downloadData = await downloadResponse.json();
+    const nextTags = (await tagsResponse.json()).tags;
+    const tagsChanged = JSON.stringify(tagLibrary) !== JSON.stringify(nextTags);
+    tagLibrary = nextTags;
     const fingerprint = JSON.stringify(data.albums);
     const oldFingerprint = JSON.stringify(albums);
     albums = data.albums;
-    if (force || fingerprint !== oldFingerprint) renderAlbums();
+    if (force || tagsChanged || fingerprint !== oldFingerprint) renderAlbums();
+    if (currentAlbum && viewer.open) {
+      const latest = albums.find(album => album.id === currentAlbum.id);
+      if (latest && JSON.stringify(currentAlbum.tagIds || []) !== JSON.stringify(latest.tagIds || [])) { currentAlbum.tagIds = latest.tagIds; renderViewerTags(currentAlbum); }
+      else if (tagsChanged) renderViewerTags(currentAlbum);
+    }
     const status = document.querySelector('#status');
     status.className = `status ${data.activity.status}`;
     status.lastElementChild.textContent = data.activity.message;
@@ -405,6 +464,7 @@ viewer.addEventListener('close', () => {
   stopVideo();
   currentImages = [];
   photoGrid.replaceChildren();
+  if (!collectionsPage.hidden && activeCollection) refreshCollections();
 });
 document.querySelector('#close').addEventListener('click', () => viewer.close());
 document.querySelector('#back').addEventListener('click', () => viewer.close());
@@ -450,7 +510,7 @@ function stopImageDrag() {
 imageStage.addEventListener('pointerup', stopImageDrag);
 imageStage.addEventListener('pointercancel', stopImageDrag);
 document.addEventListener('keydown', event => {
-  if (!lightbox.open || (viewingVideo && event.target === fullVideo)) return;
+  if (!lightbox.open || document.querySelector('#collection-picker').open || (viewingVideo && event.target === fullVideo)) return;
   if (event.key === 'ArrowLeft') openImage(currentIndex - 1);
   if (event.key === 'ArrowRight') openImage(currentIndex + 1);
 });
@@ -495,7 +555,7 @@ async function refreshStorage() {
     const data = await response.json();
     const list = document.querySelector('#storage-sizes');
     list.replaceChildren();
-    for (const [label, bytes] of [['Gallery media', data.sizes.gallery], ['Inbox', data.sizes.inbox], ['Processed archives', data.sizes.processed], ['Gallery Trash', data.sizes.trash], ['Download cache', data.sizes.downloads], ['Image previews', data.sizes.previews], ['Video posters', data.sizes.posters], ['Drive free', data.free], ['Drive total', data.total]]) {
+    for (const [label, bytes] of [['Gallery media', data.sizes.gallery], ['Inbox', data.sizes.inbox], ['Processed archives', data.sizes.processed], ['Gallery Trash', data.sizes.trash], ['Image Trash', data.sizes.imageTrash], ['Download cache', data.sizes.downloads], ['Image previews', data.sizes.previews], ['Video posters', data.sizes.posters], ['Drive free', data.free], ['Drive total', data.total]]) {
       const item = el('div'); item.append(el('dt', '', label), el('dd', '', formatBytes(bytes))); list.append(item);
     }
     document.querySelector('#storage-clear-previews').disabled = false;
@@ -522,7 +582,7 @@ async function refreshActivity() {
     const { events } = await response.json();
     const list = document.querySelector('#activity-list');
     list.replaceChildren();
-    const labels = { 'service.started': 'ImageWorks started', 'archive.import_started': 'Import started', 'archive.import_completed': 'Import completed', 'archive.moved_to_processed': 'Archive moved to Processed', 'archive.import_failed': 'Import failed', 'archive.move_failed': 'Could not move archive', 'download.started': 'Download started', 'download.completed': 'Download completed', 'download.failed': 'Download failed', 'gallery.trash_move': 'Gallery moved to Trash', 'gallery.trash_restore': 'Gallery restored', 'gallery.trash_delete': 'Gallery permanently deleted' };
+    const labels = { 'service.started': 'ImageWorks started', 'archive.import_started': 'Import started', 'archive.import_completed': 'Import completed', 'archive.moved_to_processed': 'Archive moved to Processed', 'archive.import_failed': 'Import failed', 'archive.move_failed': 'Could not move archive', 'download.started': 'Download started', 'download.completed': 'Download completed', 'download.failed': 'Download failed', 'gallery.trash_move': 'Gallery moved to Trash', 'gallery.trash_restore': 'Gallery restored', 'gallery.trash_delete': 'Gallery permanently deleted', 'gallery.created': 'Gallery created', 'gallery.image_uploaded': 'Image uploaded', 'gallery.cover_changed': 'Gallery cover changed', 'image.trash_move': 'File moved to Image Trash', 'image.trash_restore': 'File restored', 'image.trash_delete': 'File permanently deleted', 'image.trash_forget': 'File re-import allowed' };
     for (const event of events) {
       const item = el('li', event.level === 'error' ? 'activity-entry activity-error' : 'activity-entry');
       const date = new Date(event.timestamp);
@@ -531,6 +591,7 @@ async function refreshActivity() {
       item.append(time, el('strong', '', labels[event.event] || event.event.replaceAll('.', ' ').replaceAll('_', ' ')));
       const details = [];
       if (event.archive) details.push(event.archive);
+      if (event.file) details.push(event.file);
       if (event.album) details.push(`Gallery: ${event.album}`);
       if (Number.isInteger(event.images)) details.push(`${event.images} files`);
       if (Number.isInteger(event.added)) details.push(`${event.added} files added`);
@@ -653,3 +714,414 @@ async function refreshTrash() {
   } catch (error) { status.textContent = error.message; }
 }
 document.querySelector('#trash-refresh').addEventListener('click', refreshTrash);
+
+function tagChip(tag) { return el('span', `tag-chip tag-colour-${tag.colour || 'default'}`, tag.name); }
+function renderViewerTags(album) {
+  const container = document.querySelector('#viewer-tags');
+  container.replaceChildren();
+  for (const tag of tagLibrary.filter(tag => (album?.tagIds || []).includes(tag.id))) container.append(tagChip(tag));
+}
+async function tagRequest(action, body) {
+  const response = await fetch(`/api/tags/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Could not update tags.');
+  tagLibrary = data.tags;
+  renderAlbums();
+  if (currentAlbum) renderViewerTags(currentAlbum);
+  return data;
+}
+function renderTagDialog() {
+  const query = (document.querySelector('#tags-search').value || '').trim().toLocaleLowerCase();
+  const options = document.querySelector('#tags-options');
+  const manage = document.querySelector('#tags-manage-list');
+  options.replaceChildren(); manage.replaceChildren();
+  for (const tag of [...tagLibrary].sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!query || tag.name.toLocaleLowerCase().includes(query)) {
+      const label = el('label', 'tag-option');
+      const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.checked = tagDraft.has(tag.id);
+      checkbox.addEventListener('change', () => { if (checkbox.checked) tagDraft.add(tag.id); else tagDraft.delete(tag.id); });
+      label.append(checkbox, tagChip(tag)); options.append(label);
+    }
+    const row = el('div', 'tag-manage-row'); row.append(tagChip(tag));
+    const colour = el('select', 'tag-colour-select'); colour.setAttribute('aria-label', `Colour for ${tag.name}`);
+    for (const [value, label] of [['default', 'Default'], ['blue', 'Blue'], ['green', 'Green'], ['gold', 'Gold'], ['pink', 'Pink'], ['purple', 'Purple'], ['grey', 'Grey']]) { const option = el('option', '', label); option.value = value; colour.append(option); }
+    colour.value = tag.colour || 'default';
+    colour.addEventListener('change', async () => { try { await tagRequest('colour', { id: tag.id, colour: colour.value }); document.querySelector('#tags-error').textContent = ''; renderTagDialog(); } catch (error) { colour.value = tag.colour || 'default'; document.querySelector('#tags-error').textContent = error.message; } });
+    row.append(colour);
+    const rename = el('button', 'text-button', 'Rename'); rename.type = 'button'; rename.setAttribute('aria-label', `Rename tag ${tag.name}`);
+    rename.addEventListener('click', async () => {
+      const name = window.prompt(`Rename tag “${tag.name}” for all galleries:`, tag.name);
+      if (name === null) return;
+      try { await tagRequest('rename', { id: tag.id, name }); document.querySelector('#tags-error').textContent = ''; renderTagDialog(); }
+      catch (error) { document.querySelector('#tags-error').textContent = error.message; }
+    });
+    const remove = el('button', 'text-button danger-button', 'Delete'); remove.type = 'button'; remove.setAttribute('aria-label', `Delete tag ${tag.name}`);
+    remove.addEventListener('click', async () => {
+      if (!window.confirm(`Delete tag “${tag.name}” from the library and all galleries, including Trash?`)) return;
+      try { await tagRequest('delete', { id: tag.id }); tagDraft.delete(tag.id); document.querySelector('#tags-error').textContent = ''; renderTagDialog(); }
+      catch (error) { document.querySelector('#tags-error').textContent = error.message; }
+    });
+    row.append(rename, remove); manage.append(row);
+  }
+  if (!options.children.length) options.append(el('p', 'field-help', query ? 'No matching tags. Create one using the name above.' : 'No tags yet. Create one above.'));
+}
+document.querySelector('#tag-filter').addEventListener('change', renderAlbums);
+document.querySelector('#edit-tags').addEventListener('click', () => {
+  if (!currentAlbum) return;
+  tagEditingAlbum = currentAlbum.id;
+  tagDraft = new Set((currentAlbum.tagIds || []).filter(id => tagLibrary.some(tag => tag.id === id)));
+  document.querySelector('#tags-search').value = '';
+  document.querySelector('#tags-error').textContent = '';
+  renderTagDialog(); document.querySelector('#tags-dialog').showModal();
+});
+document.querySelector('#tags-search').addEventListener('input', renderTagDialog);
+document.querySelector('#tags-create').addEventListener('click', async () => {
+  try {
+    const data = await tagRequest('create', { name: document.querySelector('#tags-search').value });
+    tagDraft.add(data.tag.id); document.querySelector('#tags-search').value = '';
+    document.querySelector('#tags-error').textContent = ''; renderTagDialog();
+  } catch (error) { document.querySelector('#tags-error').textContent = error.message; }
+});
+document.querySelector('#tags-cancel').addEventListener('click', () => document.querySelector('#tags-dialog').close());
+document.querySelector('#tags-save').addEventListener('click', async event => {
+  event.target.disabled = true;
+  try {
+    const ids = [...tagDraft];
+    await tagRequest('assign', { album: tagEditingAlbum, ids });
+    if (currentAlbum?.id === tagEditingAlbum) { currentAlbum.tagIds = ids; renderViewerTags(currentAlbum); }
+    document.querySelector('#tags-dialog').close();
+    await refresh(true);
+  } catch (error) { document.querySelector('#tags-error').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+
+async function collectionRequest(action, body) {
+  const response = await fetch(`/api/collections/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Could not update collection.');
+  return data.result;
+}
+async function getCollections() {
+  const response = await fetch('/api/collections', { cache: 'no-store' });
+  if (!response.ok) throw new Error('Could not load collections.');
+  return (await response.json()).collections;
+}
+function imageSource() {
+  const item = currentImages[currentIndex];
+  return { album: collectionContext ? item?.sourceAlbumId : currentAlbum?.id, path: item?.relativePath };
+}
+async function refreshCollections() {
+  const status = document.querySelector('#collections-status');
+  try {
+    const all = await getCollections();
+    const list = document.querySelector('#collections-list'); list.replaceChildren();
+    for (const collection of all) {
+      const button = el('button', 'collection-card'); button.type = 'button';
+      button.append(el('strong', '', collection.name), el('span', '', `${collection.count} ${collection.count === 1 ? 'item' : 'items'}`));
+      button.addEventListener('click', () => openCollection(collection.id)); list.append(button);
+    }
+    status.textContent = '';
+    if (activeCollection) await openCollection(activeCollection, collectionPageIndex);
+  } catch (error) { status.textContent = error.message; }
+}
+async function openCollection(id, page = 0) {
+  const status = document.querySelector('#collection-status');
+  try {
+    const response = await fetch(`/api/collections?id=${encodeURIComponent(id)}`, { cache: 'no-store' });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not load collection.');
+    const collection = data.collection;
+    activeCollection = collection.id;
+    document.querySelector('#collections-home').hidden = true;
+    document.querySelector('#collection-detail').hidden = false;
+    document.querySelector('#collection-title').textContent = collection.name;
+    document.querySelector('#collection-delete').hidden = collection.id === 'favourites';
+    const list = document.querySelector('#collection-items'); list.replaceChildren();
+    const available = collection.items.filter(item => item.state === 'available');
+    const pages = Math.max(1, Math.ceil(collection.items.length / pageSize));
+    collectionPageIndex = Math.max(0, Math.min(page, pages - 1));
+    const start = collectionPageIndex * pageSize;
+    document.querySelector('#collection-pagination').hidden = pages <= 1;
+    document.querySelector('#collection-previous').disabled = collectionPageIndex === 0;
+    document.querySelector('#collection-next').disabled = collectionPageIndex >= pages - 1;
+    document.querySelector('#collection-page-label').textContent = `Page ${collectionPageIndex + 1} of ${pages}`;
+    for (const item of collection.items.slice(start, start + pageSize)) {
+      const card = el('article', 'collection-item');
+      if (item.state === 'available') {
+        const open = el('button', 'collection-image'); open.type = 'button'; open.setAttribute('aria-label', `View ${item.name}`);
+        const image = new Image(); image.loading = 'lazy'; image.src = item.preview; image.alt = item.name; open.append(image);
+        if (item.type === 'video') open.append(el('span', 'video-badge', '▶ WEBM'));
+        open.addEventListener('click', () => { collectionContext = true; currentImages = available; currentPage = 0; openImage(available.findIndex(media => media.id === item.id)); });
+        card.append(open);
+      } else {
+        const labels = { trashed: 'Source gallery is in Trash', 'image-trashed': 'Image is in Trash', 'image-deleted': 'Image permanently deleted', missing: 'Source not found', conflict: 'Source identity is duplicated' };
+        card.append(el('div', 'collection-placeholder', labels[item.state] || 'Source unavailable'));
+      }
+      const meta = el('div', 'collection-item-meta');
+      meta.append(el('strong', '', item.name));
+      if (item.state === 'available') {
+        const source = el('button', 'collection-source', `From: ${item.sourceName}`); source.type = 'button';
+        source.addEventListener('click', async () => {
+          await refresh(true);
+          const album = albums.find(album => album.id === item.sourceAlbumId);
+          if (album) openAlbum(album); else status.textContent = 'The source gallery is no longer available.';
+        });
+        meta.append(source);
+      } else meta.append(el('span', '', `From: ${item.sourceName}`));
+      const remove = el('button', 'text-button', 'Remove from collection'); remove.type = 'button'; remove.setAttribute('aria-label', `Remove ${item.name} from ${collection.name}`);
+      remove.addEventListener('click', async () => {
+        remove.disabled = true;
+        try { await collectionRequest('remove', { collection: collection.id, item: item.id }); await openCollection(collection.id, collectionPageIndex); status.textContent = 'Removed from this collection. The source file was not changed.'; }
+        catch (error) { status.textContent = error.message; remove.disabled = false; }
+      });
+      meta.append(remove); card.append(meta); list.append(card);
+    }
+    status.textContent = collection.items.length ? `Showing ${start + 1}–${Math.min(start + pageSize, collection.items.length)} of ${collection.items.length} ${collection.items.length === 1 ? 'item' : 'items'}.` : 'This collection is empty. Open an image in a gallery to add it.';
+  } catch (error) { status.textContent = error.message; }
+}
+document.querySelector('#collection-previous').addEventListener('click', () => activeCollection && openCollection(activeCollection, collectionPageIndex - 1));
+document.querySelector('#collection-next').addEventListener('click', () => activeCollection && openCollection(activeCollection, collectionPageIndex + 1));
+document.querySelector('#collections-back').addEventListener('click', () => { activeCollection = null; document.querySelector('#collections-home').hidden = false; document.querySelector('#collection-detail').hidden = true; refreshCollections(); });
+document.querySelector('#collection-create').addEventListener('click', async event => {
+  event.target.disabled = true;
+  try { const created = await collectionRequest('create', { name: document.querySelector('#collection-name').value }); document.querySelector('#collection-name').value = ''; await refreshCollections(); await openCollection(created.id); }
+  catch (error) { document.querySelector('#collections-status').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+document.querySelector('#collection-delete').addEventListener('click', async () => {
+  if (!activeCollection || !window.confirm('Delete this collection? The original gallery files will be kept.')) return;
+  try { await collectionRequest('delete', { collection: activeCollection }); activeCollection = null; document.querySelector('#collections-home').hidden = false; document.querySelector('#collection-detail').hidden = true; await refreshCollections(); }
+  catch (error) { document.querySelector('#collection-status').textContent = error.message; }
+});
+document.querySelector('#favourite-image').addEventListener('click', async event => {
+  event.target.disabled = true;
+  try { const result = await collectionRequest('add', { collection: 'favourites', ...imageSource() }); document.querySelector('#collection-image-status').textContent = result.alreadyAdded ? 'Already in Favourites.' : 'Added to Favourites.'; }
+  catch (error) { document.querySelector('#collection-image-status').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+async function openCollectionPicker(source) {
+  try {
+    const all = await getCollections();
+    collectionPickerSource = source;
+    document.querySelector('#collection-picker-new').value = ''; const select = document.querySelector('#collection-picker-select'); select.replaceChildren();
+    for (const collection of all) { const option = el('option', '', collection.name); option.value = collection.id; select.append(option); }
+    document.querySelector('#collection-picker-error').textContent = ''; document.querySelector('#collection-picker').showModal();
+  } catch (error) { document.querySelector(selectingImages ? '#batch-status' : '#collection-image-status').textContent = error.message; }
+}
+document.querySelector('#add-to-collection').addEventListener('click', () => openCollectionPicker(imageSource()));
+document.querySelector('#collection-picker-cancel').addEventListener('click', () => document.querySelector('#collection-picker').close());
+document.querySelector('#collection-picker-create').addEventListener('click', async event => {
+  event.target.disabled = true;
+  try {
+    const created = await collectionRequest('create', { name: document.querySelector('#collection-picker-new').value });
+    const option = el('option', '', created.name); option.value = created.id;
+    const select = document.querySelector('#collection-picker-select'); select.append(option); select.value = created.id;
+    document.querySelector('#collection-picker-new').value = ''; document.querySelector('#collection-picker-error').textContent = '';
+  } catch (error) { document.querySelector('#collection-picker-error').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+document.querySelector('#collection-picker-save').addEventListener('click', async event => {
+  event.target.disabled = true;
+  try {
+    const batch = Array.isArray(collectionPickerSource.paths);
+    const result = await collectionRequest(batch ? 'add-many' : 'add', { collection: document.querySelector('#collection-picker-select').value, ...collectionPickerSource });
+    document.querySelector('#collection-picker').close();
+    if (batch) { document.querySelector('#batch-status').textContent = `${result.added} added; ${result.alreadyAdded} already in the collection.`; selectedImages.clear(); updateBatchControls(); renderPhotoPage(currentPage); }
+    else document.querySelector('#collection-image-status').textContent = result.alreadyAdded ? 'Already in that collection.' : 'Added to collection.';
+  } catch (error) { document.querySelector('#collection-picker-error').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+
+function updateBatchControls() {
+  document.querySelector('#batch-toolbar').hidden = !selectingImages;
+  document.querySelector('#batch-count').textContent = `${selectedImages.size} selected`;
+  document.querySelector('#batch-add').disabled = selectedImages.size === 0;
+  const toggle = document.querySelector('#select-images');
+  toggle.textContent = selectingImages ? 'Done selecting' : 'Select images';
+  toggle.setAttribute('aria-pressed', selectingImages ? 'true' : 'false');
+}
+document.querySelector('#select-images').addEventListener('click', () => {
+  selectingImages = !selectingImages; selectedImages.clear(); document.querySelector('#batch-status').textContent = '';
+  updateBatchControls(); renderPhotoPage(currentPage);
+});
+document.querySelector('#batch-page').addEventListener('click', () => {
+  for (const item of currentImages.slice(currentPage * pageSize, (currentPage + 1) * pageSize)) {
+    if (selectedImages.has(item.relativePath)) continue;
+    if (selectedImages.size >= 500) { document.querySelector('#batch-status').textContent = 'Select up to 500 files at a time.'; break; }
+    selectedImages.add(item.relativePath);
+  }
+  updateBatchControls(); renderPhotoPage(currentPage);
+});
+document.querySelector('#batch-clear').addEventListener('click', () => { selectedImages.clear(); document.querySelector('#batch-status').textContent = ''; updateBatchControls(); renderPhotoPage(currentPage); });
+document.querySelector('#batch-add').addEventListener('click', () => { if (currentAlbum && selectedImages.size) openCollectionPicker({ album: currentAlbum.id, paths: [...selectedImages] }); });
+
+let metadataBackupData = null;
+async function metadataPost(action, data) {
+  const response = await fetch(`/api/metadata-restore/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'Could not process metadata backup.');
+  return result;
+}
+document.querySelector('#metadata-download').addEventListener('click', async event => {
+  event.target.disabled = true;
+  const status = document.querySelector('#metadata-status'); status.textContent = 'Preparing metadata backup…';
+  try {
+    const response = await fetch('/api/metadata-backup', { cache: 'no-store' });
+    if (!response.ok) { const error = await response.json(); throw new Error(error.error || 'Could not create backup.'); }
+    const blob = await response.blob(); const url = URL.createObjectURL(blob);
+    const link = el('a'); link.href = url; link.download = 'imageworks-metadata-backup.json'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+    status.textContent = 'Metadata backup download started. Store it separately from your gallery files.';
+  } catch (error) { status.textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+document.querySelector('#metadata-file').addEventListener('change', () => { metadataBackupData = null; document.querySelector('#metadata-restore').disabled = true; document.querySelector('#metadata-status').textContent = ''; });
+document.querySelector('#metadata-preview').addEventListener('click', async event => {
+  const status = document.querySelector('#metadata-status'); const restore = document.querySelector('#metadata-restore');
+  metadataBackupData = null; restore.disabled = true; event.target.disabled = true;
+  try {
+    const file = document.querySelector('#metadata-file').files[0];
+    if (!file) throw new Error('Choose a metadata backup file first.');
+    if (file.size > 20 * 1024 * 1024) throw new Error('Backup exceeds the 20 MB restore limit.');
+    const data = JSON.parse(await file.text());
+    const result = await metadataPost('preview', data);
+    const lines = [`${result.filesToRestore} missing metadata files can be restored.`];
+    if (result.matchedByName.length) lines.push(`Matched by folder name (check these are the original galleries): ${result.matchedByName.join(', ')}`);
+    if (result.missing.length) lines.push(`Gallery not found; its metadata will be skipped: ${result.missing.join(', ')}`);
+    if (result.conflicts.length) lines.push(`Restore blocked; existing metadata differs: ${result.conflicts.join('; ')}`);
+    else if (result.filesToRestore) { metadataBackupData = data; restore.disabled = false; }
+    else lines.push('Nothing needs restoring.');
+    status.textContent = lines.join('\n');
+  } catch (error) { status.textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+document.querySelector('#metadata-restore').addEventListener('click', async event => {
+  if (!metadataBackupData || !window.confirm('Restore the missing metadata shown in the preview? Galleries matched by name must be the original galleries. Existing different metadata will not be overwritten.')) return;
+  event.target.disabled = true;
+  try {
+    const result = await metadataPost('apply', metadataBackupData); metadataBackupData = null;
+    document.querySelector('#metadata-status').textContent = `Restored ${result.restored} metadata files. ${result.missing.length} galleries were not found.`;
+    await refresh(true);
+  } catch (error) { document.querySelector('#metadata-status').textContent = error.message; metadataBackupData = null; }
+});
+
+document.querySelectorAll('.viewer-more button').forEach(button => button.addEventListener('click', () => { document.querySelector('.viewer-more').open = false; }));
+
+let uploadInProgress = false;
+document.querySelector('#create-gallery').addEventListener('click', () => {
+  document.querySelector('#create-gallery-name').value = ''; document.querySelector('#create-gallery-error').textContent = '';
+  document.querySelector('#create-gallery-dialog').showModal(); document.querySelector('#create-gallery-name').focus();
+});
+document.querySelector('#create-gallery-cancel').addEventListener('click', () => document.querySelector('#create-gallery-dialog').close());
+document.querySelector('#create-gallery-form').addEventListener('submit', async event => {
+  event.preventDefault(); const button = document.querySelector('#create-gallery-save'); button.disabled = true;
+  try {
+    const response = await fetch('/api/albums/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: document.querySelector('#create-gallery-name').value }) });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not create gallery.');
+    document.querySelector('#create-gallery-dialog').close(); await refresh(true);
+    const album = albums.find(item => item.id === data.id); if (album) openAlbum(album);
+  } catch (error) { document.querySelector('#create-gallery-error').textContent = error.message; }
+  finally { button.disabled = false; }
+});
+document.querySelector('#add-images').addEventListener('click', () => { if (!uploadInProgress) document.querySelector('#upload-images').click(); });
+document.querySelector('#upload-images').addEventListener('change', async event => {
+  const files = [...event.target.files], albumId = currentAlbum?.id;
+  event.target.value = '';
+  if (!files.length || !albumId || uploadInProgress) return;
+  uploadInProgress = true; document.querySelector('#add-images').disabled = true;
+  let added = 0; const errors = [];
+  const status = document.querySelector('#upload-status');
+  try {
+    for (const [index, file] of files.entries()) {
+      if (viewer.open && currentAlbum?.id === albumId) status.textContent = `Uploading ${index + 1} of ${files.length}: ${file.name}`;
+      try {
+        let response;
+        for (let attempt = 0; attempt < 30; attempt++) {
+          response = await fetch(`/api/albums/upload?id=${encodeURIComponent(albumId)}&name=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+          if (response.status !== 409) break;
+          if (attempt === 29) break;
+          await response.text();
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Upload failed.');
+        added++;
+      } catch (error) { errors.push(`${file.name}: ${error.message}`); }
+    }
+    await refresh(true);
+    if (viewer.open && currentAlbum?.id === albumId) {
+      const updated = albums.find(album => album.id === albumId);
+      if (updated) await openAlbum(updated, currentPage);
+      status.textContent = `${added} of ${files.length} images added.${errors.length ? ` ${errors.join(' · ')}` : ''}`;
+    }
+  } finally { uploadInProgress = false; document.querySelector('#add-images').disabled = false; }
+});
+document.querySelector('#set-gallery-cover').addEventListener('click', async event => {
+  const source = imageSource(); event.target.disabled = true;
+  try {
+    const response = await fetch('/api/albums/cover', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: source.album, path: source.path }) });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not set the cover.');
+    document.querySelector('#collection-image-status').textContent = 'Gallery cover updated.'; await refresh(true);
+  } catch (error) { document.querySelector('#collection-image-status').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+
+document.querySelector('#trash-image').addEventListener('click', async event => {
+  const item = currentImages[currentIndex], source = imageSource();
+  if (collectionContext || !item || !source.album || !source.path) return;
+  if (!window.confirm(`Move “${item.name}” from “${source.album}” to Image Trash? You can restore it from Storage.`)) return;
+  event.target.disabled = true;
+  try {
+    const response = await fetch('/api/image-trash/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(source) });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not move the file to Trash.');
+    lightbox.close(); await refresh(true);
+    if (viewer.open && currentAlbum?.id === source.album) {
+      const updated = albums.find(album => album.id === source.album);
+      if (updated) await openAlbum(updated, currentPage);
+    }
+  } catch (error) { document.querySelector('#collection-image-status').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});
+async function refreshImageTrash() {
+  const status = document.querySelector('#image-trash-status'); status.textContent = 'Loading Image Trash…';
+  try {
+    const response = await fetch('/api/image-trash', { cache: 'no-store' });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not load Image Trash.');
+    const list = document.querySelector('#image-trash-list'); list.replaceChildren();
+    for (const entry of data.entries) {
+      const item = el('li', 'trash-entry'), details = el('div');
+      details.append(el('strong', '', entry.name), el('p', '', `From: ${entry.sourceName} · ${entry.deleted ? 'Permanently deleted; re-import blocked' : `${formatBytes(entry.sizeBytes)} · moved ${new Date(entry.trashedAt).toLocaleString()}`}`));
+      const actions = el('div', 'trash-actions');
+      if (!entry.deleted) {
+        const download = el('a', 'text-button', 'Download stored file'); download.href = `/api/image-trash/file?id=${encodeURIComponent(entry.id)}&download=1`; download.download = entry.downloadName; actions.append(download);
+      }
+      for (const [action, label] of entry.deleted ? [['forget', 'Allow re-import']] : [['restore', 'Restore'], ['delete', 'Delete permanently']]) {
+        const button = el('button', action === 'delete' ? 'text-button danger-button' : 'text-button', label); button.type = 'button'; button.setAttribute('aria-label', `${label}: ${entry.name}`);
+        button.addEventListener('click', async () => {
+          if (action === 'delete' && !window.confirm(`Permanently delete “${entry.name}” from Image Trash? This cannot be undone. Archives and download caches are separate.`)) return;
+          if (action === 'forget' && !window.confirm(`Allow “${entry.name}” to be imported again? Existing collection entries may then link to a file with the same name.`)) return;
+          button.disabled = true;
+          try {
+            const response = await fetch(`/api/image-trash/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: entry.id }) });
+            const result = await response.json(); if (!response.ok) throw new Error(result.error || 'Could not update Image Trash.');
+            await Promise.all([refreshImageTrash(), refreshStorage(), refresh(true)]);
+            status.textContent = action === 'restore' ? 'File restored.' : action === 'delete' ? 'File permanently deleted; re-import remains blocked.' : 'Re-import is allowed again.';
+          } catch (error) { status.textContent = error.message; button.disabled = false; }
+        }); actions.append(button);
+      }
+      item.append(details, actions); list.append(item);
+    }
+    status.textContent = data.entries.length ? `${data.entries.length} ${data.entries.length === 1 ? 'entry' : 'entries'} in Image Trash and deletion records.` : 'Image Trash is empty.';
+  } catch (error) { status.textContent = error.message; }
+}
+document.querySelector('#image-trash-refresh').addEventListener('click', refreshImageTrash);
+
+document.querySelector('#remove-from-collection').addEventListener('click', async event => {
+  const item = currentImages[currentIndex], collectionId = activeCollection;
+  if (!collectionContext || !collectionId || !item?.id) return;
+  event.target.disabled = true;
+  try {
+    await collectionRequest('remove', { collection: collectionId, item: item.id });
+    lightbox.close();
+    await openCollection(collectionId, collectionPageIndex);
+    document.querySelector('#collection-status').textContent = 'Removed from this collection. The source file was not changed.';
+  } catch (error) { document.querySelector('#collection-image-status').textContent = error.message; }
+  finally { event.target.disabled = false; }
+});

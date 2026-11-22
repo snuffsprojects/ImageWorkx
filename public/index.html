@@ -10,7 +10,7 @@
 <body>
   <header class="topbar">
     <a class="brand" href="#gallery" aria-label="ImageWorkx gallery"><span class="brand-mark">IW</span><span>ImageWorkx</span></a>
-    <nav class="main-nav" aria-label="Main navigation"><a href="#gallery" data-page-link="gallery">Gallery</a><a href="#download" data-page-link="download">Download</a><a href="#storage" data-page-link="storage">Storage</a><a href="#activity" data-page-link="activity">Activity</a></nav>
+    <nav class="main-nav" aria-label="Main navigation"><a href="#gallery" data-page-link="gallery">Gallery</a><a href="#collections" data-page-link="collections">Collections</a><a href="#download" data-page-link="download">Download</a><a href="#storage" data-page-link="storage">Storage</a><a href="#activity" data-page-link="activity">Activity</a></nav>
     <div id="status" class="status"><span class="status-pulse"></span><span>Watching Inbox</span></div>
   </header>
 
@@ -18,11 +18,13 @@
     <section id="gallery-page" class="page">
       <section class="intro">
         <div><p class="eyebrow">LOCAL COLLECTION</p><h1>Your galleries</h1></div>
-        <div class="stats"><strong id="album-count">0</strong> galleries <span></span> <strong id="image-count">0</strong> files <span aria-hidden="true"></span> <strong id="gallery-size" title="Combined size of gallery media; excludes archives and download cache">0 B</strong> total</div>
+        <div class="intro-actions"><div class="stats"><strong id="album-count">0</strong> galleries <span></span> <strong id="image-count">0</strong> files <span aria-hidden="true"></span> <strong id="gallery-size" title="Combined size of gallery media; excludes archives and download cache">0 B</strong> total</div><button id="create-gallery" class="text-button" type="button">+ New gallery</button></div>
       </section>
       <div class="gallery-search" role="search" aria-label="Search local collection">
-        <label for="gallery-search">Search galleries</label>
-        <input id="gallery-search" type="search" placeholder="Search names, models or 4chan threads…" autocomplete="off" aria-controls="album-grid thread-grid" aria-describedby="search-results">
+        <div class="search-fields">
+          <div class="search-field"><label for="gallery-search">Search galleries</label><input id="gallery-search" type="search" placeholder="Search names, models or 4chan threads…" autocomplete="off" aria-controls="album-grid thread-grid" aria-describedby="search-results"></div>
+          <div class="tag-filter"><label for="tag-filter">Filter by tag</label><select id="tag-filter"><option value="all">All tags</option><option value="untagged">Untagged</option></select></div>
+        </div>
         <p id="search-results" role="status" hidden></p>
       </div>
       <aside class="inbox-note" aria-label="Upload archives">
@@ -30,7 +32,7 @@
         <p>If you have configured a network share, use your server’s address and share name to access it.</p>
       </aside>
       <section id="collection-section" class="gallery-section">
-        <div class="section-heading"><h2>Collections</h2><span id="collection-count"></span></div>
+        <div class="section-heading"><h2>Galleries</h2><span id="collection-count"></span></div>
         <div id="album-grid" class="album-grid" aria-live="polite"></div>
       </section>
       <section id="thread-section" class="gallery-section thread-section" hidden>
@@ -63,6 +65,19 @@
         </section>
       </div>
     </section>
+    <section id="collections-page" class="page" hidden>
+      <section class="intro"><div><p class="eyebrow">YOUR SAVED MEDIA</p><h1>Collections</h1></div></section>
+      <div id="collections-home">
+        <p class="collection-help">Gather media from your galleries without making extra copies.</p>
+        <div class="collection-create"><label for="collection-name">New collection</label><div><input id="collection-name" maxlength="80" placeholder="Collection name" autocomplete="off"><button id="collection-create" class="save-button" type="button">Create</button></div></div>
+        <p id="collections-status" role="status"></p><div id="collections-list" class="collections-list"></div>
+      </div>
+      <section id="collection-detail" hidden>
+        <div class="collection-heading"><div><button id="collections-back" class="text-button" type="button">← All collections</button><h2 id="collection-title"></h2></div><button id="collection-delete" class="text-button danger-button" type="button">Delete collection</button></div>
+        <p class="collection-help">Removing an item from a collection does not change the source file or Trash.</p><p id="collection-status" role="status"></p><div id="collection-items" class="collection-items"></div>
+        <nav id="collection-pagination" class="collection-pagination" aria-label="Collection pages" hidden><button id="collection-previous" class="text-button" type="button">← Previous</button><span id="collection-page-label"></span><button id="collection-next" class="text-button" type="button">Next →</button></nav>
+      </section>
+    </section>
     <section id="storage-page" class="page" hidden>
       <section class="intro">
         <div><p class="eyebrow">IMAGEWORKS</p><h1>Storage usage</h1></div>
@@ -75,12 +90,28 @@
         <p>Processed archives are retained separately from gallery files. Download cache may contain files needed to resume downloads.</p>
         <button id="storage-clear-previews" class="text-button" type="button" disabled>Clear image previews</button>
         <p>Image previews are recreated as needed; originals and video posters are kept.</p>
+        <section class="metadata-section" aria-labelledby="metadata-heading">
+          <h2 id="metadata-heading">Tags and collections backup</h2>
+          <p>Download a backup of your tags, collections, gallery identities and cover choices. It does not include images, videos, archives, Image Trash records or 4chan source details; back up the data directory separately.</p>
+          <button id="metadata-download" class="text-button" type="button">Download metadata backup</button>
+          <p>To recover missing metadata, choose a backup and preview it. Restore never overwrites different existing metadata. Galleries with missing identities are matched by folder name, so check the preview before restoring.</p>
+          <label for="metadata-file">Metadata backup file</label><input id="metadata-file" type="file" accept=".json,application/json">
+          <div class="metadata-actions"><button id="metadata-preview" class="text-button" type="button">Preview restore</button><button id="metadata-restore" class="text-button" type="button" disabled>Restore missing metadata</button></div>
+          <p id="metadata-status" class="metadata-status" role="status"></p>
+        </section>
         <section class="trash-section" aria-labelledby="trash-heading">
           <h2 id="trash-heading">Gallery Trash</h2>
           <p>Galleries remain here until you restore or permanently delete them. Trash continues to use disk space.</p>
           <button id="trash-refresh" class="text-button" type="button">Load Trash</button>
           <p id="trash-status" role="status"></p>
           <ul id="trash-list" class="trash-list"></ul>
+        </section>
+        <section class="image-trash-section" aria-labelledby="image-trash-heading">
+          <h2 id="image-trash-heading">Image Trash</h2>
+          <p>Restore individual images or videos, or delete their stored files permanently. Deletion records prevent them being re-imported until you choose to allow it.</p>
+          <button id="image-trash-refresh" class="text-button" type="button">Load Image Trash</button>
+          <p id="image-trash-status" role="status"></p>
+          <ul id="image-trash-list" class="trash-list"></ul>
         </section>
         <section class="cache-section" aria-labelledby="cache-heading">
           <h2 id="cache-heading">Download cache</h2>
@@ -105,8 +136,10 @@
   <dialog id="viewer" class="viewer">
     <div class="viewer-bar">
       <div><button id="back" class="icon-button" aria-label="Back to galleries">←</button><div><small id="viewer-model" class="viewer-model"></small><strong id="viewer-title"></strong><small id="viewer-count"></small></div></div>
-      <div class="viewer-actions"><label id="thread-webm-option" class="webm-option" hidden><input id="thread-include-webm" type="checkbox"> WebM videos</label><button id="update-thread" class="text-button update-thread" type="button" hidden>Update thread</button><button id="jxl-pilot" class="text-button" type="button">JPEG XL pilot</button><button id="rename" class="text-button" type="button">Rename</button><button id="trash-gallery" class="text-button danger-button" type="button">Move to Trash</button><button id="close" class="icon-button" aria-label="Close gallery">×</button></div>
+      <div class="viewer-actions"><label id="thread-webm-option" class="webm-option" hidden><input id="thread-include-webm" type="checkbox"> WebM videos</label><button id="update-thread" class="text-button update-thread" type="button" hidden>Update thread</button><button id="add-images" class="text-button" type="button" title="JPEG, PNG, GIF, WebP, AVIF, BMP or TIFF; maximum 100 MB per file">Add images</button><button id="select-images" class="text-button" type="button" aria-pressed="false">Select images</button><button id="edit-tags" class="text-button" type="button">Tags</button><details class="viewer-more"><summary class="text-button">More</summary><div><button id="jxl-pilot" class="text-button" type="button">JPEG XL pilot</button><button id="rename" class="text-button" type="button">Rename</button><button id="trash-gallery" class="text-button danger-button" type="button">Move to Trash</button></div></details><button id="close" class="icon-button" aria-label="Close gallery">×</button></div>
     </div>
+    <input id="upload-images" type="file" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,.bmp,.tif,.tiff" multiple hidden>
+    <p id="upload-status" class="upload-status" role="status"></p>
     <div class="page-size-control"><label for="page-size">Files per page</label><select id="page-size"><option value="15" selected>15</option><option value="30">30</option><option value="60">60</option><option value="100">100</option></select></div>
     <nav class="pagination" aria-label="Gallery pages at top">
       <button id="page-previous" class="text-button" type="button">← Previous</button>
@@ -114,10 +147,14 @@
       <button id="page-next" class="text-button" type="button">Next →</button>
       <span id="page-status" class="page-status" role="status"></span>
     </nav>
+    <div id="batch-toolbar" class="batch-toolbar" hidden><span id="batch-count" role="status">0 selected</span><button id="batch-page" class="text-button" type="button">Select page</button><button id="batch-clear" class="text-button" type="button">Clear</button><button id="batch-add" class="text-button" type="button" disabled>Add to collection</button></div>
+    <p id="batch-status" class="batch-status" role="status"></p>
+    <div id="viewer-tags" class="viewer-tags" aria-label="Gallery tags"></div>
     <p id="thread-update-message" class="thread-update-message" role="status"></p>
     <p id="pilot-status" class="pilot-status" role="status"></p>
     <p id="viewer-error" class="form-error" role="alert"></p>
     <button id="gallery-back-to-top" class="back-to-top" type="button" aria-label="Back to top of gallery" title="Back to top" hidden>↑</button>
+    <p id="viewer-empty" class="viewer-empty" hidden>This gallery is empty. Choose <strong>Add images</strong> to get started.</p>
     <div id="photo-grid" class="photo-grid"></div>
     <nav class="pagination" aria-label="Gallery pages at bottom">
       <button id="page-previous-bottom" class="text-button" type="button">← Previous</button>
@@ -125,6 +162,23 @@
       <button id="page-next-bottom" class="text-button" type="button">Next →</button>
       <span id="page-status-bottom" class="page-status" role="status"></span>
     </nav>
+  </dialog>
+
+  <dialog id="create-gallery-dialog" class="rename-dialog" aria-labelledby="create-gallery-title">
+    <form id="create-gallery-form"><p class="eyebrow">YOUR GALLERIES</p><h2 id="create-gallery-title">New gallery</h2><label for="create-gallery-name">Gallery name</label><input id="create-gallery-name" maxlength="150" required autocomplete="off"><p id="create-gallery-error" class="form-error" role="alert"></p><div class="form-actions"><button id="create-gallery-cancel" class="text-button" type="button">Cancel</button><button id="create-gallery-save" class="save-button" type="submit">Create gallery</button></div></form>
+  </dialog>
+
+  <dialog id="tags-dialog" class="tags-dialog" aria-labelledby="tags-title">
+    <div class="tags-dialog-inner">
+      <p class="eyebrow">EDIT GALLERY</p><h2 id="tags-title">Gallery tags</h2>
+      <p>Choose tags for this gallery, or create one for the shared library. New tags are available immediately; save your selections with Done.</p>
+      <label for="tags-search">Search or create a tag</label>
+      <div class="tags-entry"><input id="tags-search" maxlength="60" autocomplete="off"><button id="tags-create" class="text-button" type="button">Create tag</button></div>
+      <div id="tags-options" class="tags-options"></div>
+      <p id="tags-error" class="form-error" role="alert"></p>
+      <details class="tags-manage"><summary>Manage shared tags</summary><p>Renaming or deleting a tag affects every gallery, including galleries in Trash.</p><div id="tags-manage-list"></div></details>
+      <div class="tags-actions"><button id="tags-cancel" class="text-button" type="button">Cancel</button><button id="tags-save" class="save-button" type="button">Done</button></div>
+    </div>
   </dialog>
 
   <dialog id="rename-dialog" class="rename-dialog">
@@ -138,9 +192,20 @@
     </form>
   </dialog>
 
+  <dialog id="collection-picker" class="rename-dialog" aria-labelledby="collection-picker-title">
+    <div class="collection-picker-inner"><p class="eyebrow">SAVE MEDIA</p><h2 id="collection-picker-title">Add to collection</h2>
+      <label for="collection-picker-select">Choose a collection</label><select id="collection-picker-select"></select>
+      <label for="collection-picker-new">Or create a collection</label><div class="collection-picker-create"><input id="collection-picker-new" maxlength="80" placeholder="New collection name" autocomplete="off"><button id="collection-picker-create" class="text-button" type="button">Create</button></div>
+      <p id="collection-picker-error" class="form-error" role="alert"></p>
+      <div class="form-actions"><button id="collection-picker-cancel" class="text-button" type="button">Cancel</button><button id="collection-picker-save" class="save-button" type="button">Add</button></div>
+    </div>
+  </dialog>
+
   <dialog id="lightbox" class="lightbox">
     <button id="lightbox-close" class="icon-button lightbox-close" aria-label="Close media">×</button>
     <button id="previous" class="nav-button previous" aria-label="Previous item">‹</button>
+    <div class="collection-image-actions"><button id="favourite-image" class="text-button" type="button">☆ Favourite</button><button id="add-to-collection" class="text-button" type="button">Add to collection</button><button id="set-gallery-cover" class="text-button" type="button">Set as cover</button><button id="remove-from-collection" class="text-button" type="button" hidden>Remove from collection</button><button id="trash-image" class="text-button danger-button" type="button">Trash original</button></div>
+    <p id="collection-image-status" class="collection-image-status" role="status"></p>
     <div class="zoom-controls" aria-label="Image zoom controls">
       <button id="zoom-out" class="icon-button" type="button" aria-label="Zoom out">−</button>
       <button id="zoom-reset" class="zoom-level" type="button" aria-label="Reset zoom">100%</button>

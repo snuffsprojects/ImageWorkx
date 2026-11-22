@@ -1,6 +1,6 @@
 {
   "name": "imageworkx-gallery",
-  "version": "1.3.0",
+  "version": "1.8.2",
   "private": true,
   "description": "Local RAR image importer and gallery",
   "scripts": {

@@ -82,4 +82,16 @@ test('gallery pages bound image tiles and preserve lightbox navigation across pa
   nodes.get('#lightbox').handlers.close();
   assert.equal(video.src, undefined);
   assert.ok(video.loads > 0);
+  vm.runInContext(`currentImages = Array.from({ length: 65 }, (_, i) => ({ name: i + '.jpg', relativePath: i + '.jpg', url: '/images/' + i })); renderPhotoPage(0);`, context);
+  nodes.get('#select-images').handlers.click();
+  nodes.get('#photo-grid').children[0].handlers.click();
+  assert.equal(nodes.get('#batch-count').textContent, '1 selected');
+  vm.runInContext('renderPhotoPage(1)', context);
+  nodes.get('#photo-grid').children[0].handlers.click();
+  assert.equal(nodes.get('#batch-count').textContent, '2 selected');
+  vm.runInContext('renderPhotoPage(0)', context);
+  assert.equal(nodes.get('#photo-grid').children[0]['aria-pressed'], 'true');
+  nodes.get('#batch-clear').handlers.click();
+  assert.equal(nodes.get('#batch-count').textContent, '0 selected');
+
 });
