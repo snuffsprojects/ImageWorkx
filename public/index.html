@@ -41,7 +41,7 @@
       </section>
       <section id="empty-state" class="empty-state" hidden>
         <div class="empty-icon">＋</div><h2>Add your first gallery</h2>
-        <p>Drop a ZIP or RAR into Inbox or download a 4chan thread or GoonBox album.</p>
+        <p>Drop a ZIP or RAR into Inbox or download a 4chan thread, GoonBox album or Bunkr album.</p>
         <code>ImageWorkx data directory / Inbox</code>
       </section>
     </section>
@@ -52,10 +52,10 @@
       </section>
       <div class="download-layout">
         <form id="download-form" class="download-card">
-          <label for="source-url">4chan thread or GoonBox album</label>
+          <label for="source-url">4chan thread, GoonBox album or Bunkr album</label>
           <div class="url-entry"><input id="source-url" name="url" type="url" required placeholder="Paste a link…" autocomplete="url"><button id="download-submit" class="save-button" type="submit">Download</button></div>
           <label class="webm-option"><input id="include-webm" type="checkbox"> Include WebM videos (4chan only)</label>
-          <p class="field-help">Supports boards.4chan.org, boards.4channel.org and goonbox.cr links.</p>
+          <p class="field-help">Supports boards.4chan.org, boards.4channel.org, goonbox.cr and bunkr.cr links.</p>
           <p id="download-error" class="form-error" role="alert"></p>
         </form>
         <section id="download-job" class="download-job" aria-live="polite">
@@ -136,10 +136,20 @@
   <dialog id="viewer" class="viewer">
     <div class="viewer-bar">
       <div><button id="back" class="icon-button" aria-label="Back to galleries">←</button><div><small id="viewer-model" class="viewer-model"></small><strong id="viewer-title"></strong><small id="viewer-count"></small></div></div>
-      <div class="viewer-actions"><label id="thread-webm-option" class="webm-option" hidden><input id="thread-include-webm" type="checkbox"> WebM videos</label><button id="update-thread" class="text-button update-thread" type="button" hidden>Update thread</button><button id="add-images" class="text-button" type="button" title="JPEG, PNG, GIF, WebP, AVIF, BMP or TIFF; maximum 100 MB per file">Add images</button><button id="select-images" class="text-button" type="button" aria-pressed="false">Select images</button><button id="edit-tags" class="text-button" type="button">Tags</button><details class="viewer-more"><summary class="text-button">More</summary><div><button id="jxl-pilot" class="text-button" type="button">JPEG XL pilot</button><button id="rename" class="text-button" type="button">Rename</button><button id="trash-gallery" class="text-button danger-button" type="button">Move to Trash</button></div></details><button id="close" class="icon-button" aria-label="Close gallery">×</button></div>
+      <div class="viewer-actions"><label id="thread-webm-option" class="webm-option" hidden><input id="thread-include-webm" type="checkbox"> WebM videos</label><button id="update-thread" class="text-button update-thread" type="button" hidden>Update thread</button><button id="add-images" class="text-button" type="button" title="JPEG, PNG, GIF, WebP, AVIF, BMP or TIFF; maximum 100 MB per file">Add images</button><button id="import-links" class="text-button" type="button" aria-expanded="false">Import links</button><button id="select-images" class="text-button" type="button" aria-pressed="false">Select images</button><button id="edit-tags" class="text-button" type="button">Tags</button><details class="viewer-more"><summary class="text-button">More</summary><div><button id="jxl-pilot" class="text-button" type="button">JPEG XL pilot</button><button id="rename" class="text-button" type="button">Rename</button><button id="trash-gallery" class="text-button danger-button" type="button">Move to Trash</button></div></details><button id="close" class="icon-button" aria-label="Close gallery">×</button></div>
     </div>
     <input id="upload-images" type="file" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,.bmp,.tif,.tiff" multiple hidden>
     <p id="upload-status" class="upload-status" role="status"></p>
+    <form id="import-links-form" class="download-card import-links-form" hidden>
+      <label for="gallery-links">GoonBox image links</label>
+      <textarea id="gallery-links" rows="5" required placeholder="Paste one GoonBox image link per line"></textarea>
+      <button id="import-links-submit" class="save-button" type="submit">Import into gallery</button>
+      <div id="import-links-progress" class="import-links-progress" hidden>
+        <progress id="import-links-bar" max="100" aria-label="GoonBox download progress"></progress>
+        <span id="import-links-percent" aria-hidden="true"></span>
+      </div>
+      <p id="import-links-status" class="field-help" role="status"></p>
+    </form>
     <div class="page-size-control"><label for="page-size">Files per page</label><select id="page-size"><option value="15" selected>15</option><option value="30">30</option><option value="60">60</option><option value="100">100</option></select></div>
     <nav class="pagination" aria-label="Gallery pages at top">
       <button id="page-previous" class="text-button" type="button">← Previous</button>

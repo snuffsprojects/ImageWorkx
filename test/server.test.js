@@ -24,6 +24,13 @@ test('web interface, gallery, rename, and origin protection', async t => {
       { tim: 2, filename: 'movie', ext: '.webm', fsize: 3 }
     ] });
     if (String(url).includes('i.4cdn.org')) return new Response('abc');
+    if (String(url).endsWith('/api/images/Missing')) return new Response(null, { status: 404 });
+    if (String(url).endsWith('/api/images/Good')) return Response.json({ image: {
+      original_url: 'https://simp6.cuckcapital.cr/photo.jpg', size_bytes: 3
+    } });
+    if (String(url) === 'https://simp6.cuckcapital.cr/photo.jpg') {
+      return new Response('abc', { headers: { 'Content-Type': 'image/jpeg' } });
+    }
     throw new Error('Unexpected external request: ' + url);
   };`);
   const child = spawn(process.execPath, ['--require', mockFetch, path.join(__dirname, '../server.js')], {
@@ -286,6 +293,21 @@ test('web interface, gallery, rename, and origin protection', async t => {
   assert.equal(thread.count, 1);
   assert.equal(thread.source.includeWebm, false);
   assert.deepEqual((await (await fetch(base + '/api/albums?id=4chan%20wg%20777')).json()).albums, []);
+  const links = ['https://goonbox.cr/img/Good', 'https://goonbox.cr/img/Missing'].join('\n');
+  const submitBatch = gallery => postWhenIdle('/api/download', JSON.stringify({ gallery, links }));
+  assert.equal((await submitBatch('../Example')).status, 400);
+  assert.equal((await postWhenIdle('/api/albums/create', JSON.stringify({ name: 'Batch gallery' }))).status, 201);
+  assert.equal((await submitBatch('Batch gallery')).status, 202);
+  let batchJob;
+  for (let i = 0; i < 100; i++) {
+    batchJob = (await (await fetch(base + '/api/download')).json()).download;
+    if (batchJob.status !== 'working') break;
+    await new Promise(resolve => setTimeout(resolve, 30));
+  }
+  assert.equal(batchJob.status, 'error');
+  assert.equal(batchJob.album, 'Batch gallery');
+  assert.deepEqual(batchJob.failedLinks, ['https://goonbox.cr/img/Missing']);
+  assert.equal(await fs.readFile(path.join(root, 'Gallery/Batch gallery/photo-Good.jpg'), 'utf8'), 'abc');
   let records;
   for (let i = 0; i < 100; i++) {
     records = (await fs.readFile(path.join(root, 'Logs/imageworks.log'), 'utf8')).trim().split('\n').map(JSON.parse);

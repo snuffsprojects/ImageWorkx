@@ -4,6 +4,7 @@ const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { createWriteStream } = require('node:fs');
 const { execFile } = require('node:child_process');
+const { bunkrAlbumId, bunkrPosts, requestBunkrFile } = require('./bunkr');
 const run = require('node:util').promisify(execFile);
 
 const images = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.bmp', '.tif', '.tiff']);
@@ -14,16 +15,44 @@ async function readJson(file, fallback) {
 }
 async function exists(file) { try { await fs.access(file); return true; } catch { return false; } }
 
-async function downloadMedia(source, root, log, request = fetch, { includeWebm = false } = {}) {
+function goonBoxImageIds(value) {
+  const links = value.trim().replace(/\\:/g, ':').split(/\s+/);
+  if (links.length > 250) throw new Error('Paste up to 250 GoonBox image links at a time.');
+  const ids = links.map(link => {
+    const url = URL.canParse(link.replace(/\\$/, '')) && new URL(link.replace(/\\$/, ''));
+    const id = url && url.pathname.match(/^\/img\/([a-z0-9]{1,64})\/?$/i)?.[1];
+    if (!id || !['https:', 'http:'].includes(url.protocol) || url.port || url.username || url.password ||
+        !['goonbox.cr', 'www.goonbox.cr'].includes(url.hostname)) {
+      throw new Error('Use individual GoonBox image links, one per line.');
+    }
+    return id;
+  });
+  return [...new Set(ids)];
+}
+
+function goonBoxMediaUrl(value) {
+  const url = URL.canParse(value) && new URL(value);
+  if (!url || url.protocol !== 'https:' || url.port || url.username || url.password ||
+      !/(?:^|\.)(?:goonbox\.cr|cuckcapital\.cr|selti-delivery\.ru|jpe?g\.pet|jpg\.(?:homes|church|fish|fishing)|host\.church|jpg[1-6]\.su|jpg7\.cr)$/i.test(url.hostname)) {
+    throw new Error('GoonBox returned an unexpected original image URL.');
+  }
+  return url;
+}
+
+async function downloadMedia(source, root, log, request = fetch, { includeWebm = false, batch } = {}) {
   const headers = { 'User-Agent': 'ImageWorks Gallery' };
-  async function json(url) {
-    const response = await request(url, { headers, signal: AbortSignal.timeout(30000) });
+  async function json(url, options = {}) {
+    const response = await request(url, { headers, signal: AbortSignal.timeout(30000), ...options });
     if (!response.ok) { const error = new Error(`Source returned HTTP ${response.status}; it may have expired or been deleted.`); error.httpStatus = response.status; throw error; }
     return response.json();
   }
-  const url = new URL(source);
+  const url = batch ? null : new URL(source);
+  const bunkrId = url && bunkrAlbumId(url);
   let folder, posts;
-  if (['boards.4chan.org', 'boards.4channel.org'].includes(url.hostname)) {
+  if (batch) {
+    folder = path.join(root, 'GoonBoxBatch', batch.id);
+    posts = batch.ids.map(id => ({ id }));
+  } else if (['boards.4chan.org', 'boards.4channel.org'].includes(url.hostname)) {
     const match = url.pathname.match(/^\/([a-z0-9]+)\/thread\/(\d+)(?:\/|$)/i);
     if (!match) throw new Error('Invalid thread URL.');
     const [, board, thread] = match;
@@ -58,21 +87,53 @@ async function downloadMedia(source, root, log, request = fetch, { includeWebm =
     await fs.mkdir(folder, { recursive: true });
     await fs.writeFile(path.join(folder, '.goonbox-album-id'), id);
     headers.Referer = source;
+  } else if (bunkrId) {
+    folder = path.join(root, 'Bunkr', bunkrId);
+    posts = await bunkrPosts(bunkrId, request, headers, images);
   } else throw new Error('Unsupported source.');
   await fs.mkdir(folder, { recursive: true });
   const indexFile = path.join(folder, '.download-index.json');
-  const index = await readJson(indexFile, {});
+  const index = Object.assign(Object.create(null), await readJson(indexFile, {}));
   log(`Files found: ${posts.length}`);
   let failed = 0;
+  const failedLinks = [];
   for (let i = 0; i < posts.length; i++) {
     const post = posts[i];
+    let referer;
     const prefix = `[${i + 1}/${posts.length}]`;
     const entry = index[post.id];
     // Accept existing Windows indexes, but never follow a stored path outside this folder.
-    if (entry && path.basename(entry.file) === entry.file && (!post.size || Number(entry.sourceSize) === Number(post.size)) && await exists(path.join(folder, entry.file))) {
+    if (typeof entry?.file === 'string' && path.basename(entry.file) === entry.file && (!post.size || Number(entry.sourceSize) === Number(post.size)) && await exists(path.join(folder, entry.file))) {
       log(`${prefix} Already downloaded: ${entry.file}`); continue;
     }
-    const stem = clean(post.name || post.id);
+    if (batch) {
+      referer = 'https://goonbox.cr/img/' + post.id;
+      log(prefix + ' Resolving: ' + referer);
+      try {
+        const options = { redirect: 'error', headers: { ...headers, Referer: referer } };
+        let data = await json('https://goonbox.cr/api/images/' + post.id, options);
+        if (typeof data.redirect === 'string') {
+          const next = new URL(data.redirect, referer);
+          if (next.origin !== 'https://goonbox.cr' || !/^\/api\/images\/[a-z0-9]+$/i.test(next.pathname)) {
+            throw new Error('GoonBox returned an unexpected image API redirect.');
+          }
+          data = await json(next.href, options);
+        }
+        const original = goonBoxMediaUrl(data.image?.original_url);
+        const filename = path.parse(data.image.original_filename || original.pathname);
+        post.ext = (filename.ext || path.extname(original.pathname)).toLowerCase();
+        if (!images.has(post.ext)) throw new Error('Unsupported image format.');
+        post.name = filename.name;
+        post.size = data.image.size_bytes;
+        post.url = original.href;
+      } catch (error) {
+        failedLinks.push(referer);
+        log('FAILED: ' + referer + ': ' + error.message);
+        await new Promise(resolve => setTimeout(resolve, 250));
+        continue;
+      }
+    }
+    const stem = batch ? clean(post.name.slice(0, 150 - post.id.length - 1)) + '-' + post.id : clean(post.name || post.id);
     let filename = `${stem}${post.ext}`;
     if (await exists(path.join(folder, filename))) filename = `${stem}-${clean(post.id)}${post.ext}`;
     // A stale or changed source must never overwrite a completed file.
@@ -83,7 +144,11 @@ async function downloadMedia(source, root, log, request = fetch, { includeWebm =
     const temp = `${destination}.part`;
     try {
       log(`${prefix} Downloading: ${filename}`);
-      const response = await request(post.url, { headers, signal: AbortSignal.timeout(120000) });
+      const response = bunkrId ? await requestBunkrFile(post, request, headers) : await request(post.url, { ...(batch ? { headers: { ...headers, Referer: referer }, redirect: 'error' } : { headers }), signal: AbortSignal.timeout(120000) });
+      if (batch && (!response.ok || !/^(?:image\/|application\/octet-stream(?:;|$))/i.test(response.headers.get('content-type') || ''))) {
+        await response.body?.cancel();
+        throw new Error(response.ok ? 'GoonBox did not return an image.' : 'HTTP ' + response.status);
+      }
       if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
       await pipeline(Readable.fromWeb(response.body), createWriteStream(temp));
       const stat = await fs.stat(temp);
@@ -113,13 +178,15 @@ async function downloadMedia(source, root, log, request = fetch, { includeWebm =
       await fs.rename(indexFile + '.tmp', indexFile);
     } catch (error) {
       failed++;
+      if (batch) failedLinks.push(referer);
       log(`FAILED: ${filename}: ${error.message}`);
       await fs.rm(temp, { force: true });
     }
     await new Promise(resolve => setTimeout(resolve, 250));
   }
   log(`Saved to: ${folder}`);
+  if (batch) return { failedLinks, files: batch.ids.map(id => index[id]?.file).filter(Boolean) };
   if (failed) throw new Error(`${failed} download(s) failed. Completed files remain cached; retry to resume.`);
 }
 
-module.exports = { downloadMedia };
+module.exports = { downloadMedia, goonBoxImageIds };

@@ -178,7 +178,44 @@ function showPage() {
   document.querySelectorAll('[data-page-link]').forEach(link => link.classList.toggle('active', link.dataset.pageLink === page));
 }
 
+const importLinksForm = document.querySelector('#import-links-form');
+const importLinksInput = document.querySelector('#gallery-links');
+const importLinksStatus = document.querySelector('#import-links-status');
+const importLinksButton = document.querySelector('#import-links');
+const importLinksSubmit = document.querySelector('#import-links-submit');
+const importLinksProgress = document.querySelector('#import-links-progress');
+const importLinksBar = document.querySelector('#import-links-bar');
+const importLinksPercent = document.querySelector('#import-links-percent');
+let lastLinkImport;
+
+function showLinkImportProgress(percent) {
+  importLinksProgress.hidden = false;
+  if (percent === undefined) importLinksBar.removeAttribute('value');
+  else importLinksBar.value = percent;
+  importLinksPercent.textContent = percent === undefined ? '' : percent + '%';
+}
+
+function renderLinkImport(job) {
+  importLinksSubmit.disabled = job.status === 'working';
+  if (!viewer.open || !job.targetGallery || job.targetGallery !== currentAlbum?.id) return;
+  if (job.status === 'working') {
+    // The download log reports the link currently being processed.
+    showLinkImportProgress(job.total ? Math.floor(100 * Math.max(0, job.current - 1) / job.total) : undefined);
+    importLinksStatus.textContent = job.total ? `Importing ${job.current} of ${job.total}…` : 'Starting import…';
+    return;
+  }
+  if (lastLinkImport === job.updatedAt) return;
+  lastLinkImport = job.updatedAt;
+  if (job.total) showLinkImportProgress(job.progress);
+  else importLinksProgress.hidden = true;
+  importLinksStatus.textContent = job.message;
+  if (job.failedLinks?.length) importLinksInput.value = job.failedLinks.join('\n');
+  else if (job.status === 'success') importLinksInput.value = '';
+  if (job.album) openAlbum(currentAlbum, currentPage);
+}
+
 function renderDownload(job) {
+  renderLinkImport(job);
   const panel = document.querySelector('#download-job');
   panel.className = `download-job ${job.status}`;
   document.querySelector('#download-message').textContent = job.message;
@@ -298,7 +335,15 @@ function renderPhotoPage(page = 0) {
 }
 
 async function openAlbum(album, page = 0) {
-  if (currentAlbum?.id !== album.id) document.querySelector('#upload-status').textContent = '';
+  if (!viewer.open || currentAlbum?.id !== album.id) {
+    document.querySelector('#upload-status').textContent = '';
+    importLinksForm.hidden = true;
+    importLinksProgress.hidden = true;
+    importLinksButton.setAttribute('aria-expanded', 'false');
+    importLinksInput.value = '';
+    importLinksStatus.textContent = '';
+    lastLinkImport = undefined;
+  }
   selectingImages = false; selectedImages = new Set(); updateBatchControls();
   collectionContext = false;
   if (lightbox.open) lightbox.close();
@@ -1020,6 +1065,35 @@ document.querySelector('#create-gallery-form').addEventListener('submit', async 
     const album = albums.find(item => item.id === data.id); if (album) openAlbum(album);
   } catch (error) { document.querySelector('#create-gallery-error').textContent = error.message; }
   finally { button.disabled = false; }
+});
+importLinksButton.addEventListener('click', () => {
+  importLinksForm.hidden = !importLinksForm.hidden;
+  importLinksButton.setAttribute('aria-expanded', String(!importLinksForm.hidden));
+  if (!importLinksForm.hidden) importLinksInput.focus();
+});
+importLinksForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!currentAlbum || importLinksSubmit.disabled) return;
+  importLinksSubmit.disabled = true;
+  showLinkImportProgress();
+  importLinksStatus.textContent = 'Starting import…';
+  try {
+    const response = await fetch('/api/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gallery: currentAlbum.id, links: importLinksInput.value })
+    });
+    const result = await response.json();
+    if (result.error === 'Paste a valid 4chan thread, GoonBox album or Bunkr album link.') {
+      throw new Error('Restart the ImageWorkx service to enable gallery link imports, then try again.');
+    }
+    if (!response.ok) throw new Error(result.error || 'Could not start the import.');
+    renderDownload(result.download);
+  } catch (error) {
+    importLinksProgress.hidden = true;
+    importLinksStatus.textContent = error.message;
+    importLinksSubmit.disabled = false;
+  }
 });
 document.querySelector('#add-images').addEventListener('click', () => { if (!uploadInProgress) document.querySelector('#upload-images').click(); });
 document.querySelector('#upload-images').addEventListener('change', async event => {

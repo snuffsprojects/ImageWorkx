@@ -28,7 +28,8 @@ const PREVIEW_CACHE = path.join(DATA_ROOT, '.previews');
 const getPreview = createPreviewCache(PREVIEW_CACHE);
 const PUBLIC = path.join(ROOT, 'public');
 const DOWNLOAD_CACHE = path.join(DATA_ROOT, '.downloads');
-const { downloadMedia } = require('./downloader');
+const { downloadMedia, goonBoxImageIds } = require('./downloader');
+const { bunkrAlbumId } = require('./bunkr');
 const log = require('./logger').createLogger(path.join(DATA_ROOT, 'Logs'));
 const failedImports = new Map();
 const STATE_FILE = path.join(DATA_ROOT, '.imageworks-state.json');
@@ -234,7 +235,7 @@ async function importArchive(archive) {
 }
 
 async function scanInbox() {
-  if (scanRunning || galleryTrashRunning) return;
+  if (scanRunning || galleryTrashRunning || (downloadJob.status === 'working' && downloadJob.targetGallery)) return;
   scanRunning = true;
   try {
     const entries = await fsp.readdir(INBOX, { withFileTypes: true });
@@ -322,6 +323,7 @@ function supportedDownloadUrl(value) {
     if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
     const host = url.hostname.toLowerCase();
     if ((host === 'boards.4chan.org' || host === 'boards.4channel.org') && /^\/[a-z0-9]+\/thread\/\d+/i.test(url.pathname)) return true;
+    if (bunkrAlbumId(url)) return true;
     return (host === 'goonbox.cr' || host === 'www.goonbox.cr') && /^\/a\/[a-z0-9]+/i.test(url.pathname);
   } catch { return false; }
 }
@@ -341,8 +343,10 @@ function addDownloadLog(line) {
   downloadJob.updatedAt = new Date().toISOString();
 }
 
-async function copyDownloadedImages(sourceDir, targetDir, includeWebm = false) {
-  const images = (await walkImages(sourceDir)).filter(file => includeWebm || path.extname(file).toLowerCase() !== '.webm');
+async function copyDownloadedImages(sourceDir, targetDir, includeWebm = false, requestedFiles) {
+  const selected = requestedFiles && new Set(requestedFiles);
+  const images = (await walkImages(sourceDir)).filter(file =>
+    (!selected || selected.has(path.relative(sourceDir, file))) && (includeWebm || path.extname(file).toLowerCase() !== '.webm'));
   await fsp.mkdir(targetDir, { recursive: true });
   let added = 0;
   let skipped = 0;
@@ -365,7 +369,7 @@ async function copyDownloadedImages(sourceDir, targetDir, includeWebm = false) {
   return { added, skipped, total: images.length };
 }
 
-async function finishDownload(code) {
+async function finishDownload(code, { failedLinks = [], files } = {}) {
   if (code !== 0) throw new Error(`Downloader stopped with code ${code}.`);
   const savedLine = [...downloadJob.log].reverse().find(line => line.startsWith('Saved to: '));
   if (!savedLine) throw new Error('The downloader did not report an output folder.');
@@ -373,10 +377,14 @@ async function finishDownload(code) {
   const cacheRoot = path.resolve(DOWNLOAD_CACHE);
   if (!sourceDir.startsWith(cacheRoot + path.sep)) throw new Error('The downloader returned an unexpected output folder.');
   const relative = path.relative(cacheRoot, sourceDir).split(path.sep);
-  const isGoonBox = relative[0].toLowerCase() === 'goonbox';
-  let albumName = isGoonBox
-    ? normalizeAlbumName(path.basename(sourceDir))
-    : normalizeAlbumName(`4chan ${relative.at(-2) || 'thread'} ${relative.at(-1)}`);
+  let albumName;
+  if (relative[0] === 'GoonBoxBatch') {
+    albumName = downloadJob.targetGallery;
+    downloadJob.failedLinks = failedLinks;
+    if (failedLinks.length === downloadJob.total) throw new Error('All GoonBox downloads failed. See the download log.');
+  } else if (relative[0] === 'GoonBox') albumName = normalizeAlbumName(path.basename(sourceDir));
+  else if (relative[0] === 'Bunkr') albumName = normalizeAlbumName(`Bunkr ${relative[1]}`);
+  else albumName = normalizeAlbumName(`4chan ${relative.at(-2) || 'thread'} ${relative.at(-1)}`);
   if (downloadJob.source?.type === '4chan') {
     for (const entry of await fsp.readdir(GALLERY, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
@@ -388,7 +396,7 @@ async function finishDownload(code) {
     }
   }
   const albumDir = path.join(GALLERY, albumName);
-  const result = await copyDownloadedImages(sourceDir, albumDir, downloadJob.source?.includeWebm === true);
+  const result = await copyDownloadedImages(sourceDir, albumDir, downloadJob.source?.includeWebm === true, files);
   if (downloadJob.source?.type === '4chan') {
     await fsp.writeFile(path.join(albumDir, '.imageworks-source.json'), JSON.stringify(downloadJob.source, null, 2));
   }
@@ -398,25 +406,47 @@ async function finishDownload(code) {
   downloadJob.message = result.added
     ? `Added ${result.added} file${result.added === 1 ? '' : 's'} to ${albumName}`
     : `${albumName} is already up to date`;
+  if (failedLinks.length) {
+    downloadJob.status = 'error';
+    downloadJob.message += '. ' + failedLinks.length + ' failed. Retry the failed links from this gallery.';
+  }
   downloadJob.album = albumName;
   downloadJob.updatedAt = new Date().toISOString();
-  activity = { status: 'success', message: downloadJob.message, archive: null, updatedAt: downloadJob.updatedAt };
+  activity = { status: downloadJob.status, message: downloadJob.message, archive: null, updatedAt: downloadJob.updatedAt };
   log('info', 'download.completed', { album: albumName, ...result });
 }
 
 async function startDownload(req, res) {
-  const body = await readJson(req);
+  let body, batch;
+  try {
+    body = await readJson(req, 65536);
+    if (body.links !== undefined) {
+      if (typeof body.links !== 'string') throw new Error('Paste individual GoonBox image links.');
+      batch = { gallery: body.gallery, ids: goonBoxImageIds(body.links) };
+    }
+  } catch (error) { return sendJson(res, 400, { error: error.message }); }
   const url = typeof body.url === 'string' ? body.url.trim() : '';
-  if (!supportedDownloadUrl(url)) return sendJson(res, 400, { error: 'Paste a valid 4chan thread or GoonBox album link.' });
+  if (!batch && !supportedDownloadUrl(url)) return sendJson(res, 400, { error: 'Paste a valid 4chan thread, GoonBox album or Bunkr album link.' });
   if (downloadJob.status === 'working' || cacheRemovalRunning || galleryTrashRunning) return sendJson(res, 409, { error: 'A download or gallery operation is already running.' });
-  downloadJob.status = 'working';
-  try { await fsp.mkdir(DOWNLOAD_CACHE, { recursive: true }); } catch (error) { downloadJob.status = 'error'; throw error; }
-  const source = await getDownloadSource(url);
+  if (batch && (scanRunning || pilotJob.status === 'working')) return sendJson(res, 409, { error: 'Wait for the current gallery operation to finish.' });
+  const previousJob = downloadJob;
+  downloadJob = { ...previousJob, status: 'working' };
+  if (batch) {
+    try {
+      const dir = await galleryMedia.albumDirectory(GALLERY, batch.gallery);
+      batch.id = await collections.ensureGalleryId(dir);
+    } catch {
+      downloadJob = previousJob;
+      return sendJson(res, 400, { error: 'Open an existing gallery before importing links.' });
+    }
+  }
+  try { await fsp.mkdir(DOWNLOAD_CACHE, { recursive: true }); } catch (error) { downloadJob = previousJob; throw error; }
+  const source = batch ? null : await getDownloadSource(url);
   if (source) source.includeWebm = body.includeWebm === true;
-  downloadJob = { status: 'working', message: 'Starting download…', url, source, progress: 0, current: 0, total: 0, log: [], updatedAt: new Date().toISOString() };
+  downloadJob = { status: 'working', message: 'Starting download…', url, source, targetGallery: batch?.gallery, progress: 0, current: 0, total: 0, log: [], updatedAt: new Date().toISOString() };
   log('info', 'download.started');
-  downloadMedia(url, DOWNLOAD_CACHE, addDownloadLog, fetch, { includeWebm: source?.includeWebm === true })
-    .then(() => finishDownload(0))
+  downloadMedia(url, DOWNLOAD_CACHE, addDownloadLog, fetch, { includeWebm: source?.includeWebm === true, batch })
+    .then(result => finishDownload(0, result))
     .catch(error => {
       log('error', 'download.failed', { error });
       downloadJob.status = 'error';

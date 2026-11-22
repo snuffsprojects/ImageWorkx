@@ -96,6 +96,14 @@ A small deletion record remains after permanent deletion to prevent archive impo
 
 Open the **Storage** tab for an on-demand breakdown of gallery media, Inbox, processed archives, download cache, image previews and video posters, plus drive capacity and free space. Folder sizes represent file lengths and may differ from allocated disk usage. Image previews can be cleared from this panel; they are regenerated when needed. Processed archives and download cache are not deleted by that control. Use **Load cached downloads** to inspect and remove individual download cache folders. Their completion status is not tracked, so review before removing: retries may re-download files and updates may create duplicates. Removal is disabled while downloads are active; gallery files are kept.
 
+## Import GoonBox links into a gallery
+
+Create a gallery with **+ New gallery** or open an existing one. Choose **Import links**, paste individual GoonBox image-page links, and select **Import into gallery**. Duplicate links are skipped, and successful images are added even if some links fail. Failed links are left in the input for retry.
+
+## Bunkr albums
+
+Open **Download** and paste a bunkr.cr album link. Standard and advanced album links work. ImageWorkx saves supported images in a gallery named **Bunkr <album ID>**. Submit the same link again to retry a failed download or fetch newly added images.
+
 ## WebM videos
 
 Check **Include WebM videos** when downloading a 4chan thread. For an existing
