@@ -9,6 +9,8 @@ const downloadPage = document.querySelector('#download-page');
 const galleryPage = document.querySelector('#gallery-page');
 const collectionsPage = document.querySelector('#collections-page');
 const storagePage = document.querySelector('#storage-page');
+const migrationPage = document.querySelector('#migration-page');
+const migrationWorkerPage = document.querySelector('#migration-worker-page');
 const activityPage = document.querySelector('#activity-page');
 let albums = [];
 let tagLibrary = [];
@@ -94,11 +96,18 @@ function el(tag, className, text) {
 }
 
 function formatBytes(bytes) {
+  if (bytes < 0) return '−' + formatBytes(-bytes);
   if (!bytes) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1000)), units.length - 1);
   return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: unit ? 1 : 0 }).format(bytes / 1000 ** unit)} ${units[unit]}`;
 }
+
+const migrationLabels = {
+  queued: 'JPEG XL conversion queued',
+  verified: 'JPEG XL conversion verified',
+  attention: 'JPEG XL migration needs attention'
+};
 
 function renderAlbums() {
   albumGrid.replaceChildren();
@@ -141,6 +150,14 @@ function renderAlbums() {
     if (album.cover) { const image = new Image(); image.loading = 'lazy'; image.src = album.cover; image.alt = ''; cover.append(image); }
     else cover.append(el('span', 'empty-cover', 'Empty gallery'));
     if (album.coverType === 'video') cover.append(el('span', 'video-badge', '▶ WEBM'));
+    if (album.migration && migrationLabels[album.migration.state]) {
+      const label = migrationLabels[album.migration.state];
+      const dot = el('span', 'migration-dot ' + album.migration.state);
+      dot.title = label;
+      dot.setAttribute('aria-hidden', 'true');
+      button.setAttribute('aria-label', button.getAttribute('aria-label') + '. ' + label);
+      cover.append(dot);
+    }
     if (isThread) cover.append(el('span', 'thread-badge', '4CHAN'));
     const meta = el('div', 'album-meta');
     if (album.model) meta.append(el('span', 'album-model', album.model));
@@ -166,12 +183,16 @@ function renderAlbums() {
 }
 
 function showPage() {
-  const page = ['#collections', '#download', '#storage', '#activity'].includes(location.hash) ? location.hash.slice(1) : 'gallery';
+  const page = ['#collections', '#download', '#storage', '#activity', '#migration', '#migration-worker'].includes(location.hash) ? location.hash.slice(1) : 'gallery';
   galleryPage.hidden = page !== 'gallery';
   collectionsPage.hidden = page !== 'collections';
   if (page === 'collections') refreshCollections();
   downloadPage.hidden = page !== 'download';
   storagePage.hidden = page !== 'storage';
+  migrationPage.hidden = page !== 'migration';
+  if (page === 'migration') { refreshMigration(); pollCleanup(); }
+  migrationWorkerPage.hidden = page !== 'migration-worker';
+  if (!migrationWorkerPage.hidden) refreshMigrationWorker();
   activityPage.hidden = page !== 'activity';
   if (page === 'activity') refreshActivity();
   if (page === 'storage') refreshStorage();
@@ -577,7 +598,6 @@ viewer.addEventListener('close', updateBackToTop);
 window.addEventListener('hashchange', updateBackToTop);
 document.querySelector('#gallery-search').addEventListener('input', renderAlbums);
 window.addEventListener('hashchange', showPage);
-showPage();
 refresh();
 setInterval(refresh, 3000);
 
@@ -591,6 +611,313 @@ document.querySelector('#page-size').addEventListener('change', event => {
   viewer.scrollTop = 0;
 });
 
+const migrationToggle = document.querySelector('#migration-toggle');
+const migrationStatus = document.querySelector('#migration-status');
+let migrationEnabled = false;
+let migrationRequest = 0;
+const migrationCleanupButton = document.querySelector('#migration-cleanup-all');
+const migrationCleanupStatus = document.querySelector('#migration-cleanup-status');
+const migrationCleanupProgress = document.querySelector('#migration-cleanup-progress');
+let cleanupSelection, cleanupJob = null, cleanupStarting = false, cleanupPolling = false, cleanupGeneration = 0;
+
+function cleanupBusy() { return cleanupStarting || cleanupJob?.status === 'working'; }
+
+function cleanupProgressText(job) {
+  if (job.phase === 'waiting') return 'Waiting for the current JPEG to finish before cleanup…';
+  if (!job.total) return 'Preparing bulk cleanup…';
+  const verifying = job.phase === 'verifying';
+  const done = verifying ? job.verified : job.cleaned;
+  const percent = Math.floor(100 * done / job.total);
+  return (verifying ? 'Verified ' : 'Cleaned ') + done + ' of ' + job.total + ' galleries (' + percent + '%)' +
+    (job.gallery ? ' · ' + job.gallery : '');
+}
+
+function renderCleanup(job) {
+  cleanupJob = job;
+  migrationCleanupButton.disabled = cleanupBusy() || !cleanupSelection?.revision;
+  migrationCleanupProgress.hidden = !job || (job.status === 'error' && !job.total);
+  if (!job) return;
+  if (job.total) {
+    const completed = job.phase === 'verifying' ? job.verified : job.cleaned;
+    migrationCleanupProgress.value = Math.floor(100 * completed / job.total);
+  } else migrationCleanupProgress.removeAttribute('value');
+  if (job.status === 'success') {
+    migrationCleanupStatus.textContent = 'Cleanup complete · 100% · ' + job.cleaned + ' galleries cleaned · ' + job.files + ' originals removed.';
+  } else if (job.status === 'error') {
+    migrationCleanupStatus.textContent = job.error + (job.files ? ' Removed ' + job.files + ' originals before stopping.' : '');
+  } else migrationCleanupStatus.textContent = cleanupProgressText(job);
+}
+
+async function pollCleanup() {
+  if (cleanupPolling || cleanupStarting) return;
+  cleanupPolling = true;
+  const generation = cleanupGeneration;
+  try {
+    const response = await fetch('/api/jxl-migration/cleanup-all', { cache: 'no-store' });
+    if (!response.ok) return;
+    const { job } = await response.json();
+    if (generation !== cleanupGeneration || !job) return;
+    const terminal = job.status !== 'working' && (cleanupJob?.id !== job.id || cleanupJob.status === 'working');
+    renderCleanup(job);
+    if (terminal) {
+      await refreshMigration();
+      await refresh(true);
+    }
+  } catch { /* The next poll can reconnect without interrupting cleanup. */ }
+  finally { cleanupPolling = false; }
+}
+setInterval(() => { if (!migrationPage.hidden) pollCleanup(); }, 1500);
+
+async function migrationAction(suffix, body) {
+  const response = await fetch('/api/jxl-migration' + suffix, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || 'The migration operation could not be completed.');
+  return result;
+}
+
+function migrationSizeList(list, totals, free) {
+  const sizes = [
+    ['Original JPEG size', totals.original], ['JPEG XL size', totals.encoded],
+    ['Originals still retained', totals.retained], ['Reclaimed by cleanup', totals.reclaimed],
+    ['Net file-size savings', totals.net], ['Net allocated space saved', totals.allocatedNet]
+  ];
+  if (free !== undefined) sizes.push(['Drive free now', free]);
+  list.replaceChildren(...sizes.map(([label, value]) => {
+    const row = el('div');
+    row.append(el('dt', '', label), el('dd', '', formatBytes(value)));
+    return row;
+  }));
+}
+
+const migrationGroups = {
+  ready: 'Ready to review',
+  queued: 'Waiting for conversion',
+  attention: 'Needs attention',
+  blocked: 'Cleanup blocked',
+  complete: 'Finished',
+  unavailable: 'Unavailable'
+};
+
+function migrationGroup(gallery) {
+  return Object.hasOwn(migrationGroups, gallery.readiness) ? gallery.readiness : 'unavailable';
+}
+
+function renderMigrationGroups(list, galleries) {
+  const expandedGroups = new Map([...list.querySelectorAll('.migration-group')].map(group => [group.dataset.status, group.open]));
+  const expandedGalleries = new Set([...list.querySelectorAll('.migration-gallery[open]')].map(gallery => gallery.dataset.id));
+  const grouped = new Map(Object.keys(migrationGroups).map(status => [status, []]));
+  for (const gallery of galleries) grouped.get(migrationGroup(gallery)).push(gallery);
+  grouped.get('ready').sort((a, b) => b.totals.retained - a.totals.retained || a.name.localeCompare(b.name));
+
+  const groups = document.createDocumentFragment();
+  for (const [status, members] of grouped) {
+    const drawer = el('details', 'migration-group');
+    drawer.dataset.status = status;
+    drawer.open = expandedGroups.get(status) ?? status === 'ready';
+    const heading = el('summary');
+    heading.append(el('span', 'migration-readiness ' + status, migrationGroups[status]),
+      el('span', 'migration-group-count', members.length + (members.length === 1 ? ' gallery' : ' galleries')));
+    drawer.append(heading);
+    for (const gallery of members) drawer.append(renderMigrationGallery(gallery, expandedGalleries.has(gallery.id || gallery.name)));
+    if (!members.length) drawer.append(el('p', 'migration-group-empty', 'No galleries with this status.'));
+    groups.append(drawer);
+  }
+  list.replaceChildren(groups);
+}
+
+function renderMigrationGallery(gallery, expanded) {
+  const section = el('details', 'migration-gallery');
+  section.dataset.id = gallery.id || gallery.name;
+  section.open = expanded;
+  const counts = gallery.counts;
+  const messages = {
+    queued: 'Waiting for JPEG conversion',
+    ready: 'Ready to review for cleanup',
+    complete: 'Finished · no originals to clean up',
+    attention: 'Needs attention',
+    blocked: 'Cleanup blocked · a retained original or its replacement is unavailable',
+    unavailable: 'Gallery unavailable'
+  };
+  const readiness = migrationGroup(gallery);
+  const status = messages[gallery.readiness] || 'Restart ImageWorks to see migration readiness';
+  const summary = el('summary');
+  summary.append(el('span', 'migration-gallery-name', gallery.name),
+    el('span', 'migration-readiness ' + readiness, status));
+  const indicators = [];
+  if (readiness === 'ready') indicators.push(formatBytes(gallery.totals.retained) + ' reclaimable');
+  if (counts?.pending) indicators.push(counts.pending + ' JPEGs pending');
+  if (counts?.skipped || counts?.failed) indicators.push('JPEG exceptions listed below');
+  if (counts) indicators.push(counts.retained + ' retained originals / ' + counts.images + ' gallery images');
+  if (indicators.length) summary.append(el('span', 'migration-summary-counts', indicators.join(' · ')));
+  const breakdown = el('p', 'migration-counts');
+  if (counts) {
+    const details = [
+      [counts.other, 'non-JPEG images'], [counts.pending, 'JPEGs pending'], [counts.removed, 'originals already cleaned up'],
+      [counts.skipped, 'JPEGs skipped'], [counts.failed, 'JPEGs failed'], [counts.restored, 'originals restored'],
+      [counts.needsAttention, 'files needing attention'], [counts.videos, 'videos excluded']
+    ].filter(([count]) => count > 0).map(([count, label]) => count + ' ' + label);
+    breakdown.textContent = counts.retained + ' retained JPEG originals / ' + counts.images + ' gallery images' +
+      (details.length ? ' · ' + details.join(' · ') : '');
+  } else breakdown.textContent = 'Gallery image count unavailable.';
+  const sizes = el('dl', 'storage-sizes');
+  migrationSizeList(sizes, gallery.totals);
+  const actions = el('div', 'migration-actions');
+  if (gallery.active) {
+    const open = el('button', 'text-button', 'Open gallery');
+    open.addEventListener('click', async () => {
+      const response = await fetch('/api/albums?id=' + encodeURIComponent(gallery.name));
+      const album = (await response.json()).albums?.[0];
+      if (album) openAlbum(album);
+      else migrationStatus.textContent = 'Gallery unavailable.';
+    });
+    actions.append(open);
+  }
+  if (gallery.review) {
+    for (const [action, label, question] of [
+      ['restore', 'Restore retained originals', 'Restore the retained JPEGs and remove their JPEG XL replacements?'],
+      ['cleanup', gallery.readiness === 'queued' ? 'Remove reviewed originals so far' : 'Remove retained originals',
+        gallery.readiness === 'queued' ? 'JPEGs are still pending. Permanently remove only the originals already verified and listed here?'
+          : 'Permanently remove the reviewed JPEG originals for this gallery?']
+    ]) {
+      const button = el('button', 'text-button' + (action === 'cleanup' ? ' danger-button' : ''), label);
+      button.addEventListener('click', async () => {
+        if (!window.confirm(gallery.name + ' · ' + question)) return;
+        for (const control of actions.querySelectorAll('button')) control.disabled = true;
+        try {
+          await migrationAction('/' + action, { id: gallery.id, revision: gallery.review });
+          await refreshMigration();
+          await refresh(true);
+        } catch (error) { migrationStatus.textContent = error.message; }
+        finally { for (const control of actions.querySelectorAll('button')) control.disabled = false; }
+      });
+      actions.append(button);
+    }
+  }
+  const files = el('ul', 'migration-files');
+  const descriptions = { retained: 'Verified · original retained', removed: 'Verified · original removed',
+    restored: 'Original restored', failed: 'Failed', skipped: 'Skipped', retry: 'Queued for retry',
+    publishing: 'Publication interrupted', restoring: 'Restore interrupted', cleaning: 'Cleanup interrupted' };
+  for (const file of gallery.files) {
+    const row = el('li');
+    row.append(el('strong', '', file.path));
+    const date = file.removedAt || file.restoredAt || file.convertedAt || file.at;
+    const detail = [descriptions[file.state] || file.state];
+    if (file.encodedBytes) detail.push(formatBytes(file.originalBytes) + ' → ' + formatBytes(file.encodedBytes));
+    if (date) detail.push(new Date(date).toLocaleString());
+    if (file.message) detail.push(file.message);
+    row.append(el('span', '', detail.join(' · ')));
+    files.append(row);
+  }
+  section.append(summary, breakdown, sizes, actions, files);
+  return section;
+}
+
+async function refreshMigration() {
+  const request = ++migrationRequest;
+  try {
+    const response = await fetch('/api/jxl-migration', { cache: 'no-store' });
+    if (!response.ok) throw new Error('Could not read the JPEG XL migration report.');
+    const report = await response.json();
+    if (request !== migrationRequest) return;
+    migrationEnabled = report.enabled;
+    cleanupSelection = Array.isArray(report.cleanupAll?.ids) ? report.cleanupAll : null;
+    migrationCleanupButton.disabled = cleanupBusy() || !cleanupSelection?.revision;
+    if (!cleanupBusy() && !cleanupJob) {
+      migrationCleanupStatus.textContent = !cleanupSelection ? 'Restart ImageWorks to enable bulk cleanup.'
+        : cleanupSelection.galleries ? cleanupSelection.galleries +
+          (cleanupSelection.galleries === 1 ? ' gallery ready' : ' galleries ready') + ' · ' +
+          formatBytes(cleanupSelection.bytes) + ' reclaimable.'
+        : 'No galleries ready for bulk cleanup.';
+    }
+    migrationToggle.disabled = false;
+    migrationToggle.textContent = report.enabled ? 'Pause background migration' : 'Start background migration';
+    const status = report.current ? report.current.name + ' · ' + report.current.relative : report.message;
+    migrationStatus.textContent = (report.enabled ? 'Migration enabled.' : 'Migration paused.') +
+      (status ? ' ' + status : '') + ' Free-space floor ' + formatBytes(report.minFree) +
+      ' · Retained originals limit ' + formatBytes(report.maxRetained) + '.';
+    migrationSizeList(document.querySelector('#migration-totals'), report.totals, report.free);
+    renderMigrationGroups(document.querySelector('#migration-galleries'), report.galleries);
+  } catch (error) { if (request === migrationRequest) migrationStatus.textContent = error.message; }
+}
+document.querySelector('#migration-refresh').addEventListener('click', refreshMigration);
+migrationToggle.addEventListener('click', async () => {
+  migrationToggle.disabled = true;
+  try { await migrationAction('', { enabled: !migrationEnabled }); await refreshMigration(); }
+  catch (error) { migrationStatus.textContent = error.message; migrationToggle.disabled = false; }
+});
+
+migrationCleanupButton.addEventListener('click', async () => {
+  if (cleanupBusy() || !cleanupSelection?.revision) return;
+  const { revision, ids, galleries, bytes } = cleanupSelection;
+  if (!window.confirm('Permanently remove ' + formatBytes(bytes) + ' of retained JPEG originals across ' + galleries +
+    (galleries === 1 ? ' gallery' : ' galleries') + ' marked Ready to review?')) return;
+  cleanupGeneration++;
+  cleanupStarting = true;
+  migrationCleanupButton.disabled = true;
+  migrationCleanupProgress.hidden = false;
+  migrationCleanupProgress.removeAttribute('value');
+  migrationCleanupStatus.textContent = 'Starting bulk cleanup…';
+  try {
+    const { job } = await migrationAction('/cleanup-all', { revision, ids });
+    renderCleanup(job);
+  } catch (error) {
+    cleanupJob = null;
+    migrationCleanupProgress.hidden = true;
+    migrationCleanupStatus.textContent = error.message;
+  } finally {
+    cleanupStarting = false;
+    migrationCleanupButton.disabled = cleanupBusy() || !cleanupSelection?.revision;
+  }
+});
+
+let workerRefreshPending = false;
+let workerLogFingerprint = '';
+
+async function refreshMigrationWorker() {
+  if (workerRefreshPending) return;
+  workerRefreshPending = true;
+  const status = document.querySelector('#migration-worker-status');
+  const file = document.querySelector('#migration-worker-file');
+  const logStatus = document.querySelector('#migration-worker-log-status');
+  try {
+    const response = await fetch('/api/jxl-migration/worker', { cache: 'no-store' });
+    if (!response.ok) throw new Error('Could not read the worker status.');
+    const worker = await response.json();
+    const label = worker.cleanup?.status === 'working' ? cleanupProgressText(worker.cleanup) : worker.current ? worker.current.stage : worker.message || (worker.enabled ? 'Waiting for work.' : 'Worker paused.');
+    if (status.textContent !== label) status.textContent = label;
+    file.hidden = !worker.current;
+    file.textContent = worker.current ? worker.current.name + ' · ' + worker.current.relative : '';
+    logStatus.textContent = worker.events.length ? '' : 'No migration events recorded yet.';
+    const fingerprint = JSON.stringify(worker.events);
+    if (fingerprint === workerLogFingerprint) return;
+    const labels = {
+      started: 'Processing started', converted: 'Verified and converted', skipped: 'Skipped',
+      failed: 'Conversion failed', cleaned_up: 'Retained original removed', restored: 'Original restored',
+      paused: 'Worker paused', enabled: 'Worker enabled', status: 'Worker status'
+    };
+    const events = document.createDocumentFragment();
+    for (const event of worker.events) {
+      const row = el('li', event.level === 'error' ? 'activity-entry activity-error' : 'activity-entry');
+      const time = el('time', '', new Date(event.timestamp).toLocaleString());
+      time.dateTime = event.timestamp;
+      row.append(time, el('strong', '', labels[event.event] || event.event));
+      const details = [event.album, event.file];
+      if (event.event === 'converted') details.push(formatBytes(event.originalBytes) + ' → ' + formatBytes(event.encodedBytes));
+      if (event.message) details.push(event.message);
+      row.append(el('p', '', details.filter(Boolean).join(' · ')));
+      events.append(row);
+    }
+    document.querySelector('#migration-worker-events').replaceChildren(events);
+    workerLogFingerprint = fingerprint;
+  } catch (error) {
+    status.textContent = error.message;
+    file.hidden = true;
+  } finally { workerRefreshPending = false; }
+}
+setInterval(() => { if (!migrationWorkerPage.hidden) refreshMigrationWorker(); }, 2000);
+
 async function refreshStorage() {
   const message = document.querySelector('#storage-message');
   message.textContent = 'Calculating storage usage…';
@@ -600,7 +927,7 @@ async function refreshStorage() {
     const data = await response.json();
     const list = document.querySelector('#storage-sizes');
     list.replaceChildren();
-    for (const [label, bytes] of [['Gallery media', data.sizes.gallery], ['Inbox', data.sizes.inbox], ['Processed archives', data.sizes.processed], ['Gallery Trash', data.sizes.trash], ['Image Trash', data.sizes.imageTrash], ['Download cache', data.sizes.downloads], ['Image previews', data.sizes.previews], ['Video posters', data.sizes.posters], ['Drive free', data.free], ['Drive total', data.total]]) {
+    for (const [label, bytes] of [['Gallery media', data.sizes.gallery], ['Inbox', data.sizes.inbox], ['Processed archives', data.sizes.processed], ['Gallery Trash', data.sizes.trash], ['Image Trash', data.sizes.imageTrash], ['Retained JPEG originals', data.sizes.jpegOriginals], ['Download cache', data.sizes.downloads], ['Image previews', data.sizes.previews], ['Video posters', data.sizes.posters], ['Drive free', data.free], ['Drive total', data.total]]) {
       const item = el('div'); item.append(el('dt', '', label), el('dd', '', formatBytes(bytes))); list.append(item);
     }
     document.querySelector('#storage-clear-previews').disabled = false;
@@ -789,7 +1116,11 @@ function renderTagDialog() {
     }
     const row = el('div', 'tag-manage-row'); row.append(tagChip(tag));
     const colour = el('select', 'tag-colour-select'); colour.setAttribute('aria-label', `Colour for ${tag.name}`);
-    for (const [value, label] of [['default', 'Default'], ['blue', 'Blue'], ['green', 'Green'], ['gold', 'Gold'], ['pink', 'Pink'], ['purple', 'Purple'], ['grey', 'Grey']]) { const option = el('option', '', label); option.value = value; colour.append(option); }
+    for (const value of ['default', 'red', 'orange', 'gold', 'lime', 'green', 'teal', 'cyan', 'blue', 'indigo', 'purple', 'pink', 'brown', 'grey']) {
+      const option = el('option', '', value[0].toUpperCase() + value.slice(1));
+      option.value = value;
+      colour.append(option);
+    }
     colour.value = tag.colour || 'default';
     colour.addEventListener('change', async () => { try { await tagRequest('colour', { id: tag.id, colour: colour.value }); document.querySelector('#tags-error').textContent = ''; renderTagDialog(); } catch (error) { colour.value = tag.colour || 'default'; document.querySelector('#tags-error').textContent = error.message; } });
     row.append(colour);
@@ -1199,3 +1530,5 @@ document.querySelector('#remove-from-collection').addEventListener('click', asyn
   } catch (error) { document.querySelector('#collection-image-status').textContent = error.message; }
   finally { event.target.disabled = false; }
 });
+
+showPage();

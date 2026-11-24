@@ -99,6 +99,7 @@
           <div class="metadata-actions"><button id="metadata-preview" class="text-button" type="button">Preview restore</button><button id="metadata-restore" class="text-button" type="button" disabled>Restore missing metadata</button></div>
           <p id="metadata-status" class="metadata-status" role="status"></p>
         </section>
+        <p><a href="#migration">Open JPEG XL migration report</a></p>
         <section class="trash-section" aria-labelledby="trash-heading">
           <h2 id="trash-heading">Gallery Trash</h2>
           <p>Galleries remain here until you restore or permanently delete them. Trash continues to use disk space.</p>
@@ -120,6 +121,38 @@
           <p id="cache-status" role="status"></p>
           <ul id="cache-list" class="cache-list"></ul>
         </section>
+      </div>
+    </section>
+    <section id="migration-page" class="page" hidden>
+      <section class="intro"><div><h1>JPEG XL migration</h1></div></section>
+      <div class="storage-panel">
+        <div class="migration-actions">
+          <button id="migration-toggle" class="save-button" type="button" disabled>Start background migration</button>
+          <button id="migration-cleanup-all" class="text-button danger-button" type="button" disabled>Clean up ready galleries</button>
+          <button id="migration-refresh" class="text-button" type="button">Refresh report</button>
+          <a href="#migration-worker">View worker and log</a>
+          <a href="#storage">Back to Storage</a>
+        </div>
+        <p id="migration-status" role="status"></p>
+        <p id="migration-cleanup-status" class="field-help" role="status"></p>
+        <progress id="migration-cleanup-progress" class="migration-cleanup-progress" max="100" aria-label="Bulk JPEG cleanup progress" hidden></progress>
+        <dl id="migration-totals" class="storage-sizes"></dl>
+        <div id="migration-galleries"></div>
+      </div>
+    </section>
+    <section id="migration-worker-page" class="page" hidden>
+      <section class="intro"><div><h1>JPEG XL worker</h1></div></section>
+      <div class="storage-panel">
+        <a href="#migration">Back to migration report</a>
+        <section class="migration-worker-current" aria-labelledby="migration-worker-heading">
+          <h2 id="migration-worker-heading">Current work</h2>
+          <p id="migration-worker-status" role="status">Loading worker status…</p>
+          <p id="migration-worker-file" hidden></p>
+        </section>
+        <h2>Migration log</h2>
+        <p class="activity-note">Latest 100 events. Updates automatically while this screen is open.</p>
+        <p id="migration-worker-log-status"></p>
+        <ol id="migration-worker-events" class="activity-list"></ol>
       </div>
     </section>
     <section id="activity-page" class="page" hidden>

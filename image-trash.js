@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const collections = require('./collections');
+const { suffix, isJpeg, isMigrated, physicalPath } = require('./jpeg-xl-paths');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function validName(name) { return typeof name === 'string' && name && name !== '.' && name !== '..' && path.basename(name) === name && !name.includes('\\'); }
 async function directory(dir) { try { const stat = await fs.lstat(dir); return stat.isDirectory() && !stat.isSymbolicLink(); } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
@@ -12,7 +13,7 @@ async function readEntry(root, id) {
   const metadata = path.join(wrapper, 'info.json'), metaStat = await fs.lstat(metadata);
   if (!metaStat.isFile() || metaStat.isSymbolicLink()) throw new Error('Invalid Image Trash metadata.');
   const info = JSON.parse(await fs.readFile(metadata, 'utf8'));
-  if (!UUID.test(info.galleryId || '') || !validName(info.sourceName) || !collections.validRelative(info.path) || typeof info.trashedAt !== 'string') throw new Error('Invalid Image Trash metadata.');
+  if (!UUID.test(info.galleryId || '') || !validName(info.sourceName) || !collections.validRelative(info.path) || typeof info.trashedAt !== 'string' || (info.migrated && !isJpeg(info.path))) throw new Error('Invalid Image Trash metadata.');
   let stat = null;
   try { stat = await fs.lstat(path.join(wrapper, 'media')); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Invalid trashed file.'); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -56,9 +57,10 @@ async function move(galleryRoot, root, album, relative) {
   await fs.mkdir(wrapper);
   let moved = false;
   try {
-    const info = { galleryId, sourceName: album, path: relative, trashedAt: new Date().toISOString() };
+    const file = await physicalPath(path.join(dir, relative));
+    const info = { migrated: isMigrated(file), galleryId, sourceName: album, path: relative, trashedAt: new Date().toISOString() };
     await fs.writeFile(path.join(wrapper, 'info.json'), JSON.stringify(info), { flag: 'wx' });
-    await fs.rename(path.join(dir, ...relative.split('/')), path.join(wrapper, 'media'));
+    await fs.rename(file, path.join(wrapper, 'media'));
     moved = true; return { id, ...info };
   } finally { if (!moved) await fs.rm(wrapper, { recursive: true, force: true }); }
 }
@@ -68,7 +70,7 @@ async function list(root, galleryRoot, trashRoot) {
     const found = locations.get(entry.info.galleryId) || [];
     const source = found.length === 1 ? found[0] : null;
     return { id: entry.id, name: path.basename(entry.info.path).replace(/\.jxl$/i, ''), sourceName: source?.name || entry.info.sourceName,
-      galleryState: found.length > 1 ? 'conflict' : source?.state || 'missing', trashedAt: entry.info.trashedAt, sizeBytes: entry.stat?.size || 0, deleted: !entry.stat, downloadName: path.basename(entry.info.path) };
+      galleryState: found.length > 1 ? 'conflict' : source?.state || 'missing', trashedAt: entry.info.trashedAt, sizeBytes: entry.stat?.size || 0, deleted: !entry.stat, downloadName: path.basename(entry.info.path) + (entry.info.migrated ? '.jxl' : '') };
   }).sort((a, b) => b.trashedAt.localeCompare(a.trashedAt));
 }
 async function restore(galleryRoot, trashRoot, root, id) {
@@ -85,7 +87,12 @@ async function restore(galleryRoot, trashRoot, root, id) {
     try { await fs.mkdir(dir); } catch (error) { if (error.code !== 'EEXIST') throw error; }
     if (!await directory(dir)) throw new Error('The original folder is not a real directory.');
   }
-  const source = path.join(entry.wrapper, 'media'), destination = path.join(dir, filename);
+  const source = path.join(entry.wrapper, 'media'), destination = path.join(dir, filename + (entry.info.migrated ? suffix : ''));
+  const alternate = path.join(dir, filename + (entry.info.migrated ? '' : suffix));
+  try {
+    await fs.lstat(alternate);
+    throw new Error('A file already exists at the original location.');
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
   try { await fs.link(source, destination); }
   catch (error) {
     if (error.code !== 'EEXIST') throw error;

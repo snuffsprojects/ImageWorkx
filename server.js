@@ -6,6 +6,8 @@ const { spawn } = require('child_process');
 const { createPosterCache, fallbackPoster, parseRange } = require('./video');
 const { createPreviewCache, cleanPreviews } = require('./previews');
 const { readActivity } = require('./activity');
+const { createMigration } = require('./jpeg-xl-migration');
+const { isJpeg, isMigrated, logicalPath, physicalPath } = require('./jpeg-xl-paths');
 const { createPilot } = require('./jpeg-xl-pilot');
 const tags = require('./tags');
 const collections = require('./collections');
@@ -54,6 +56,39 @@ let summaryCache = null;
 let summaryGeneration = 0;
 let summaryScan = null;
 function invalidateSummary() { summaryGeneration++; summaryCache = null; }
+function galleryOperationsBusy() {
+  return galleryTrashRunning || scanRunning || downloadJob.status === 'working' || pilotJob.status === 'working';
+}
+function limitBytes(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value * 1024 ** 3) : fallback * 1024 ** 3;
+}
+
+const migration = createMigration({
+  dataRoot: DATA_ROOT, galleryRoot: GALLERY, trashRoot: TRASH,
+  discover: async () => {
+    const galleries = [];
+    for (const entry of (await fsp.readdir(GALLERY, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(GALLERY, entry.name);
+      const media = (await walkImages(dir)).map(file => path.relative(dir, file).split(path.sep).join('/'));
+      const files = media.filter(isJpeg);
+      galleries.push({ name: entry.name, dir, files, media, id: await collections.readGalleryId(dir) });
+    }
+    return galleries;
+  },
+  publish: async operation => {
+    if (galleryOperationsBusy()) return;
+    galleryTrashRunning = true;
+    try { return await operation(); }
+    finally { galleryTrashRunning = false; }
+  },
+  changed: invalidateSummary,
+  idle: () => !galleryOperationsBusy(),
+  minFree: limitBytes('IMAGEWORKS_JXL_MIN_FREE_GIB', 5),
+  maxRetained: limitBytes('IMAGEWORKS_JXL_MAX_RETAINED_GIB', 20)
+});
+
 async function getSummary() {
   while (!summaryCache) {
     if (!summaryScan) {
@@ -159,9 +194,10 @@ async function walkImages(root, current = root) {
   for (const entry of await fsp.readdir(current, { withFileTypes: true })) {
     const full = path.join(current, entry.name);
     if (entry.isDirectory()) output.push(...await walkImages(root, full));
-    else if (entry.isFile() && IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && (!/\.jxl$/i.test(entry.name) || /\.jpe?g\.jxl$/i.test(entry.name))) output.push(full);
+    else if (entry.isFile() && IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && (!/\.jxl$/i.test(entry.name) || /\.jpe?g(?:\.imageworks)?\.jxl$/i.test(entry.name))) output.push(full);
   }
-  return output;
+  const present = new Set(output);
+  return output.filter(file => !isMigrated(file) || !present.has(logicalPath(file)));
 }
 
 function run7zip(archive, destination) {
@@ -187,12 +223,12 @@ function run7zip(archive, destination) {
 }
 
 async function uniqueDestination(target, reserved = new Set()) {
-  if (!reserved.has(target) && !await exists(target)) return target;
+  if (!reserved.has(target) && !await exists(await physicalPath(target))) return target;
   const ext = path.extname(target);
   const stem = target.slice(0, -ext.length);
   for (let n = 2; ; n++) {
     const candidate = `${stem} (${n})${ext}`;
-    if (!reserved.has(candidate) && !await exists(candidate)) return candidate;
+    if (!reserved.has(candidate) && !await exists(await physicalPath(candidate))) return candidate;
   }
 }
 
@@ -296,10 +332,13 @@ async function getAlbums({ id, summary = false } = {}) {
     const dir = path.join(GALLERY, entry.name);
     const images = await walkImages(dir);
     if (!images.length && !await galleryMedia.manualGallery(dir) && !await collections.readGalleryId(dir)) continue;
+    const galleryId = await collections.readGalleryId(dir);
+    const migrationStatus = migration.summary(galleryId,
+      images.filter(isJpeg).map(file => path.relative(dir, file).split(path.sep).join('/')), images.filter(isMigrated).length);
     const items = await Promise.all(images.map(async file => {
       const stat = await fsp.stat(file);
-      const relative = path.relative(GALLERY, file).split(path.sep).map(encodeURIComponent).join('/');
-      return { name: path.basename(file).replace(/\.jxl$/i, ''), relativePath: path.relative(dir, file).split(path.sep).join('/'), preview: path.extname(file).toLowerCase() === '.webm' ? null : `/preview/${relative}`, type: path.extname(file).toLowerCase() === '.webm' ? 'video' : 'image', poster: path.extname(file).toLowerCase() === '.webm' ? `/poster/${relative}` : null, url: path.extname(file).toLowerCase() === '.jxl' ? `/reconstructed/${relative}` : `/gallery/${relative}`, jxl: path.extname(file).toLowerCase() === '.jxl', sizeBytes: stat.size, modifiedAt: stat.mtime.toISOString() };
+      const relative = path.relative(GALLERY, logicalPath(file)).split(path.sep).map(encodeURIComponent).join('/');
+      return { name: path.basename(logicalPath(file)).replace(/\.jxl$/i, ''), relativePath: path.relative(dir, logicalPath(file)).split(path.sep).join('/'), preview: path.extname(file).toLowerCase() === '.webm' ? null : `/preview/${relative}`, type: path.extname(file).toLowerCase() === '.webm' ? 'video' : 'image', poster: path.extname(file).toLowerCase() === '.webm' ? `/poster/${relative}` : null, url: path.extname(file).toLowerCase() === '.jxl' ? `/reconstructed/${relative}` : `/gallery/${relative}`, jxl: path.extname(file).toLowerCase() === '.jxl', sizeBytes: stat.size, modifiedAt: stat.mtime.toISOString() };
     }));
     items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     const modifiedAt = items.length ? items.reduce((latest, item) => item.modifiedAt > latest ? item.modifiedAt : latest, items[0].modifiedAt) : (await fsp.stat(dir)).mtime.toISOString();
@@ -312,7 +351,7 @@ async function getAlbums({ id, summary = false } = {}) {
     const details = source?.type === '4chan'
       ? { name: entry.name, model: '', set: source.title || `Thread ${source.threadId}` }
       : albumDetails(entry.name);
-    albums.push({ id: entry.name, ...details, kind: source?.type || 'collection', source, tagIds, tagError, count: items.length, sizeBytes: items.reduce((sum, item) => sum + item.sizeBytes, 0), cover: coverItem ? coverItem.poster || coverItem.preview || coverItem.url : null, coverType: coverItem?.type || null, modifiedAt, ...(summary ? {} : { images: items }) });
+    albums.push({ id: entry.name, ...details, kind: source?.type || 'collection', source, tagIds, tagError, migration: migrationStatus, count: items.length, sizeBytes: items.reduce((sum, item) => sum + item.sizeBytes, 0), cover: coverItem ? coverItem.poster || coverItem.preview || coverItem.url : null, coverType: coverItem?.type || null, modifiedAt, ...(summary ? {} : { images: items }) });
   }
   return albums.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
 }
@@ -358,6 +397,9 @@ async function copyDownloadedImages(sourceDir, targetDir, includeWebm = false, r
     if (reserved.has(relative.split(path.sep).join('/'))) { skipped++; continue; }
     const requested = path.join(targetDir, relative);
     await fsp.mkdir(path.dirname(requested), { recursive: true });
+    const physical = await physicalPath(requested);
+    if (physical !== requested &&
+        (await migration.matchesOriginal(galleryId, relative.split(path.sep).join('/'), image))) { skipped++; continue; }
     if (await exists(requested)) {
       const [sourceStat, targetStat] = await Promise.all([fsp.stat(image), fsp.stat(requested)]);
       if (sourceStat.size === targetStat.size) { skipped++; continue; }
@@ -525,8 +567,10 @@ async function serveFile(req, res, root, relative) {
 }
 
 async function serveReconstructed(req, res, relative) {
-  const file = safeResolve(GALLERY, decodeURIComponent(relative));
-  if (!file || !/\.jpe?g\.jxl$/i.test(file)) return sendJson(res, 404, { error: 'Not found' });
+  const requested = safeResolve(GALLERY, decodeURIComponent(relative));
+  const file = requested && await physicalPath(requested);
+  if (requested && file === requested && isJpeg(requested)) return serveFile(req, res, GALLERY, relative);
+  if (!file || !/\.jpe?g(?:\.imageworks)?\.jxl$/i.test(file)) return sendJson(res, 404, { error: 'Not found' });
   try { if (!(await fsp.stat(file)).isFile()) throw new Error(); }
   catch { return sendJson(res, 404, { error: 'Not found' }); }
   const child = spawn(process.env.IMAGEWORKS_DJXL || 'djxl', [file, '-', '--output_format=jpeg', '--num_threads=1', '--quiet'], { stdio: ['ignore', 'pipe', 'ignore'] });
@@ -571,7 +615,7 @@ async function directorySize(dir) {
 }
 
 async function storageInfo() {
-  const folders = { inbox: INBOX, processed: PROCESSED, downloads: DOWNLOAD_CACHE, trash: TRASH, imageTrash: IMAGE_TRASH, previews: PREVIEW_CACHE, posters: path.join(DATA_ROOT, '.posters') };
+  const folders = { jpegOriginals: migration.originals, inbox: INBOX, processed: PROCESSED, downloads: DOWNLOAD_CACHE, trash: TRASH, imageTrash: IMAGE_TRASH, previews: PREVIEW_CACHE, posters: path.join(DATA_ROOT, '.posters') };
   const sizes = {};
   for (const [name, dir] of Object.entries(folders)) sizes[name] = await directorySize(dir);
   sizes.gallery = (await getSummary()).reduce((sum, album) => sum + album.sizeBytes, 0);
@@ -580,13 +624,15 @@ async function storageInfo() {
 }
 
 async function servePreview(req, res, relative) {
-  const file = safeResolve(GALLERY, decodeURIComponent(relative));
+  const requested = safeResolve(GALLERY, decodeURIComponent(relative));
+  const file = requested && await physicalPath(requested);
   if (!file || !IMAGE_EXTENSIONS.has(path.extname(file).toLowerCase()) || path.extname(file).toLowerCase() === '.webm') return sendJson(res, 404, { error: 'Not found' });
   let stat;
   try { stat = await fsp.stat(file); if (!stat.isFile()) throw new Error(); }
   catch { return sendJson(res, 404, { error: 'Not found' }); }
   const preview = await getPreview(file, stat);
   if (preview) return serveFile(req, res, PREVIEW_CACHE, path.basename(preview));
+  if (/\.jxl$/i.test(file)) return serveReconstructed(req, res, relative);
   return serveFile(req, res, GALLERY, relative);
 }
 
@@ -711,6 +757,41 @@ async function handleRequest(req, res) {
     } catch (error) { return sendJson(res, 400, { error: error.code === 'ENOENT' ? 'Gallery not found.' : error.message }); }
     finally { galleryTrashRunning = false; }
   }
+  if (url.pathname === '/api/jxl-migration/worker' && req.method === 'GET') return sendJson(res, 200, await migration.monitor());
+  if (url.pathname === '/api/jxl-migration' && req.method === 'GET') return sendJson(res, 200, await migration.report());
+  if (url.pathname === '/api/jxl-migration' && req.method === 'POST') {
+    const body = await readJson(req);
+    try { await migration.setEnabled(body.enabled); return sendJson(res, 200, { ok: true }); }
+    catch (error) { return sendJson(res, 400, { error: error.message }); }
+  }
+  if (url.pathname === '/api/jxl-migration/cleanup-all') {
+    if (req.method === 'GET') return sendJson(res, 200, { job: migration.cleanupStatus() });
+    if (req.method === 'POST') {
+      const body = await readJson(req, 1024 * 1024);
+      if (typeof body.revision !== 'string' || !Array.isArray(body.ids) || !body.ids.length ||
+          body.ids.some(id => typeof id !== 'string' || id.length !== 36)) {
+        return sendJson(res, 400, { error: 'Refresh the migration report before starting cleanup.' });
+      }
+      if ((galleryOperationsBusy() && !migration.isConverting()) || migration.cleanupStatus()?.status === 'working') return sendJson(res, 409, { error: 'Wait for the current gallery operation to finish.' });
+      migration.cleanupAll(body.revision, body.ids, async operation => {
+        if (galleryOperationsBusy()) throw new Error('Another gallery operation started. Try cleanup again once it finishes.');
+        galleryTrashRunning = true;
+        try { return await operation(); }
+        finally { galleryTrashRunning = false; }
+      }).catch(() => { /* The migration job records the failure for the report. */ });
+      return sendJson(res, 202, { job: migration.cleanupStatus() });
+    }
+  }
+  if (['/api/jxl-migration/restore', '/api/jxl-migration/cleanup'].includes(url.pathname) && req.method === 'POST') {
+    const body = await readJson(req);
+    if (galleryOperationsBusy()) return sendJson(res, 409, { error: 'Wait for the current gallery operation to finish.' });
+    galleryTrashRunning = true;
+    try {
+      await migration.review(body.id, body.revision, url.pathname.endsWith('/restore') ? 'restore' : 'cleanup');
+      return sendJson(res, 200, { ok: true });
+    } catch (error) { return sendJson(res, 409, { error: error.message }); }
+    finally { galleryTrashRunning = false; }
+  }
   if (url.pathname === '/api/jxl-pilot' && req.method === 'GET') return sendJson(res, 200, { pilot: pilotJob });
   if (url.pathname === '/api/jxl-pilot' && req.method === 'POST') {
     const body = await readJson(req);
@@ -787,7 +868,12 @@ async function handleRequest(req, res) {
   if (url.pathname.startsWith('/reconstructed/')) return serveReconstructed(req, res, url.pathname.slice(15));
   if (url.pathname.startsWith('/preview/')) return servePreview(req, res, url.pathname.slice(9));
   if (url.pathname.startsWith('/poster/')) return servePoster(req, res, url.pathname.slice(8));
-  if (url.pathname.startsWith('/gallery/')) return serveFile(req, res, GALLERY, url.pathname.slice(9));
+  if (url.pathname.startsWith('/gallery/')) {
+    const relative = url.pathname.slice(9);
+    const requested = safeResolve(GALLERY, decodeURIComponent(relative));
+    if (requested && isMigrated(await physicalPath(requested)) && isJpeg(requested)) return serveReconstructed(req, res, relative);
+    return serveFile(req, res, GALLERY, relative);
+  }
   const requested = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
   return serveFile(req, res, PUBLIC, requested);
 }
@@ -795,6 +881,8 @@ async function handleRequest(req, res) {
 async function main() {
   await Promise.all([fsp.mkdir(INBOX, { recursive: true }), fsp.mkdir(GALLERY, { recursive: true }), fsp.mkdir(DOWNLOAD_CACHE, { recursive: true })]);
   await loadState();
+  await migration.load();
+  setInterval(() => migration.tick(), 2000).unref();
   await getSummary();
   setInterval(() => { invalidateSummary(); getSummary().catch(error => log('error', 'gallery.scan_failed', { error })); }, 60000).unref();
   const cleanupPreviews = () => cleanPreviews(PREVIEW_CACHE).catch(error => log('error', 'preview.cleanup_failed', { error }));

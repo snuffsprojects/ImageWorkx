@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const TAG_FILE = '.imageworks-tags.json';
-const COLOURS = ['default', 'blue', 'green', 'gold', 'pink', 'purple', 'grey'];
+const COLOURS = ['default', 'blue', 'green', 'gold', 'pink', 'purple', 'grey', 'red', 'orange', 'lime', 'teal', 'cyan', 'indigo', 'brown'];
 
 function nameOf(value) {
   if (typeof value !== 'string') throw new Error('Enter a tag name.');

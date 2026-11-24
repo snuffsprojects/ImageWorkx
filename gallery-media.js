@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { logicalPath, physicalPath } = require('./jpeg-xl-paths');
 const MANUAL = '.imageworks-manual.json';
 const COVER = '.imageworks-cover.json';
 const MAX_UPLOAD = 100 * 1024 * 1024;
@@ -64,7 +65,7 @@ async function upload(root, album, name, length, stream, reserved = new Set()) {
     const ext = path.extname(name), stem = name.slice(0, -ext.length);
     for (let n = 1; ; n++) {
       const chosen = n === 1 ? name : `${stem} (${n})${ext}`;
-      if (reserved.has(chosen)) continue;
+      if (reserved.has(chosen) || await physicalPath(path.join(dir, chosen)) !== path.join(dir, chosen)) continue;
       try { await fs.link(temp, path.join(dir, chosen)); return { name: chosen, sizeBytes: count }; }
       catch (error) { if (error.code !== 'EEXIST') throw error; }
     }
@@ -82,7 +83,7 @@ async function readCover(dir) {
 }
 async function setCover(root, album, relative, images) {
   const dir = await albumDirectory(root, album);
-  if (!validCoverPath(relative) || !images.some(file => path.relative(dir, file).split(path.sep).join('/') === relative && path.extname(file).toLowerCase() !== '.webm')) throw new Error('Choose an image from this gallery.');
+  if (!validCoverPath(relative) || !images.some(file => path.relative(dir, logicalPath(file)).split(path.sep).join('/') === relative && path.extname(file).toLowerCase() !== '.webm')) throw new Error('Choose an image from this gallery.');
   const file = path.join(dir, COVER), temp = path.join(dir, `.imageworks-cover-${randomUUID()}.tmp`);
   try { await fs.writeFile(temp, JSON.stringify({ path: relative }), { flag: 'wx' }); await fs.rename(temp, file); }
   finally { await fs.rm(temp, { force: true }).catch(() => {}); }

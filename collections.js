@@ -1,10 +1,11 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { isMigrated, physicalPath } = require('./jpeg-xl-paths');
 const FILE = '.imageworks-collections.json';
 const GALLERY_ID = '.imageworks-gallery-id';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MEDIA = /\.(?:jpe?g|png|gif|webp|avif|bmp|tiff?|webm|jpe?g\.jxl)$/i;
+const MEDIA = /\.(?:jpe?g|png|gif|webp|avif|bmp|tiff?|webm|jpe?g(?:\.imageworks)?\.jxl)$/i;
 function validName(name) { return typeof name === 'string' && name && name !== '.' && name !== '..' && path.basename(name) === name && !name.includes('\\'); }
 function validRelative(rel) { return typeof rel === 'string' && rel.length > 0 && !rel.includes('\\') && !path.isAbsolute(rel) && rel.split('/').every(p => p && p !== '.' && p !== '..') && MEDIA.test(rel); }
 async function directory(dir) { try { const s = await fs.lstat(dir); return s.isDirectory() && !s.isSymbolicLink(); } catch (e) { if (e.code === 'ENOENT') return false; throw e; } }
@@ -24,7 +25,7 @@ async function ensureGalleryId(dir) {
   try { await fs.writeFile(path.join(dir, GALLERY_ID), id + '\n', { flag: 'wx' }); return id; }
   catch (error) { if (error.code === 'EEXIST') return readGalleryId(dir); throw error; }
 }
-async function regularFile(root, relative) {
+async function exactFile(root, relative) {
   if (!validRelative(relative) || !await directory(root)) return false;
   let current = root;
   const parts = relative.split('/');
@@ -36,6 +37,11 @@ async function regularFile(root, relative) {
     }
     return true;
   } catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false; throw error; }
+}
+async function regularFile(root, relative) {
+  if (!validRelative(relative)) return false;
+  const file = await physicalPath(path.join(root, relative));
+  return exactFile(root, path.relative(root, file).split(path.sep).join('/'));
 }
 async function read(root) {
   let data;
@@ -129,11 +135,13 @@ async function detail(root, galleryRoot, trashRoot, id, imageReferences = new Ma
     const output = { id: item.id, state, name: displayName, sourceName: match?.name || item.sourceName, sourceAlbumId: state === 'available' ? match.name : null, relativePath: item.path };
     if (state === 'available') {
       const relative = [match.name, ...item.path.split('/')].map(encodeURIComponent).join('/');
-      const video = /\.webm$/i.test(item.path), jxl = /\.jpe?g\.jxl$/i.test(item.path);
+      const video = /\.webm$/i.test(item.path);
+      const file = await physicalPath(path.join(match.dir, item.path));
+      const jxl = /\.jpe?g\.jxl$/i.test(file) || isMigrated(file);
       Object.assign(output, { type: video ? 'video' : 'image', jxl, poster: video ? `/poster/${relative}` : null, preview: video ? `/poster/${relative}` : `/preview/${relative}`, url: `${jxl ? '/reconstructed/' : '/gallery/'}${relative}` });
     }
     items.push(output);
   }
   return { id: c.id, name: c.name, items };
 }
-module.exports = { read, create, add, addMany, remove, removeCollection, detail, noteRenamed, validRelative, regularFile, readGalleryId, ensureGalleryId, locations, GALLERY_ID, FILE };
+module.exports = { read, create, add, addMany, remove, removeCollection, detail, noteRenamed, validRelative, regularFile, exactFile, readGalleryId, ensureGalleryId, locations, GALLERY_ID, FILE };

@@ -4,12 +4,25 @@ const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { promisify } = require('node:util');
 const execFile = promisify(require('node:child_process').execFile);
+const { isMigrated, logicalPath } = require('./jpeg-xl-paths');
 const galleryMedia = require('./gallery-media');
 
 async function sha256(file) {
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(file)) hash.update(chunk);
   return hash.digest('hex');
+}
+
+async function verifyJpeg(input, output, reconstructed, run = execFile, onStage = () => {}) {
+  onStage('Encoding JPEG XL');
+  const before = await sha256(input);
+  await run(process.env.IMAGEWORKS_CJXL || 'cjxl', [input, output, '--lossless_jpeg=1', '--num_threads=1', '--quiet'], { timeout: 120000 });
+  onStage('Verifying reconstructed JPEG');
+  await run(process.env.IMAGEWORKS_DJXL || 'djxl', [output, reconstructed, '--num_threads=1', '--quiet'], { timeout: 120000 });
+  if (before !== await sha256(reconstructed) || before !== await sha256(input)) {
+    throw new Error('Verification failed or source changed.');
+  }
+  return before;
 }
 
 async function createPilot({ galleryRoot, dataRoot, albumId, onProgress = () => {}, run = execFile }) {
@@ -28,7 +41,7 @@ async function createPilot({ galleryRoot, dataRoot, albumId, onProgress = () => 
       for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
         const rel = path.join(relative, entry.name);
         if (entry.isDirectory()) await collect(path.join(dir, entry.name), rel);
-        else if (entry.isFile() && /\.(jpe?g|png|webp|gif|avif|bmp|tiff?|webm)$/i.test(entry.name)) files.push(rel);
+        else if (entry.isFile() && (isMigrated(rel) || /\.(jpe?g|png|webp|gif|avif|bmp|tiff?|webm)$/i.test(entry.name))) files.push(rel);
       }
     }
     await collect(source);
@@ -39,15 +52,12 @@ async function createPilot({ galleryRoot, dataRoot, albumId, onProgress = () => 
     for (const rel of files) {
       const input = path.join(source, rel);
       const jpeg = /\.jpe?g$/i.test(rel);
-      const output = path.join(staging, jpeg ? `${rel}.jxl` : rel);
+      const output = path.join(staging, jpeg || isMigrated(rel) ? logicalPath(rel) + '.jxl' : rel);
       await fs.mkdir(path.dirname(output), { recursive: true });
       if (!jpeg) { await fs.copyFile(input, output, fs.constants.COPYFILE_EXCL); continue; }
       const reconstructed = path.join(work, 'verify.jpg');
-      const before = await sha256(input);
       const stat = await fs.stat(input);
-      await run(process.env.IMAGEWORKS_CJXL || 'cjxl', [input, output, '--lossless_jpeg=1', '--num_threads=1', '--quiet'], { timeout: 120000 });
-      await run(process.env.IMAGEWORKS_DJXL || 'djxl', [output, reconstructed, '--num_threads=1', '--quiet'], { timeout: 120000 });
-      if (before !== await sha256(reconstructed) || before !== await sha256(input)) throw new Error(`Verification failed or source changed: ${rel}`);
+      await verifyJpeg(input, output, reconstructed, run);
       await fs.unlink(reconstructed);
       inputBytes += stat.size;
       outputBytes += (await fs.stat(output)).size;
@@ -55,7 +65,7 @@ async function createPilot({ galleryRoot, dataRoot, albumId, onProgress = () => 
     }
     const cover = await galleryMedia.readCover(source);
     if (cover) {
-      const pilotCover = /\.jpe?g$/i.test(cover) ? `${cover}.jxl` : cover;
+      const pilotCover = /\.jpe?g$/i.test(cover) ? cover + '.jxl' : cover;
       try {
         const stat = await fs.lstat(path.join(staging, pilotCover));
         if (stat.isFile()) await fs.writeFile(path.join(staging, galleryMedia.COVER), JSON.stringify({ path: pilotCover }), { flag: 'wx' });
@@ -75,4 +85,4 @@ async function createPilot({ galleryRoot, dataRoot, albumId, onProgress = () => 
     await fs.rm(work, { recursive: true, force: true });
   }
 }
-module.exports = { createPilot };
+module.exports = { createPilot, verifyJpeg, sha256 };

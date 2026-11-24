@@ -1,8 +1,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-function createLogger(directory, { maxBytes = 5 * 1024 * 1024, backups = 3 } = {}) {
-  const file = path.join(directory, 'imageworks.log');
+function createLogger(directory, { maxBytes = 5 * 1024 * 1024, backups = 3, filename = 'imageworks.log', mirror = true } = {}) {
+  const file = path.join(directory, filename);
   return function log(level, event, details = {}) {
     const record = { timestamp: new Date().toISOString(), level, event, ...details };
     if (details.error instanceof Error) {
@@ -12,7 +12,7 @@ function createLogger(directory, { maxBytes = 5 * 1024 * 1024, backups = 3 } = {
         stdout: error.stdout, stderr: error.stderr };
     }
     const line = JSON.stringify(record) + '\n';
-    (level === 'error' ? process.stderr : process.stdout).write(line);
+    if (mirror) (level === 'error' ? process.stderr : process.stdout).write(line);
     try {
       fs.mkdirSync(directory, { recursive: true });
       if (fs.existsSync(file) && fs.statSync(file).size + Buffer.byteLength(line) > maxBytes) {
